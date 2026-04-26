@@ -2,9 +2,11 @@ data/raw/
 data/parsed/
 reports/
 runs/
+logs/
 *.ndjson
 *.csv
 *.joblib
 __pycache__/
 *.pyc
 .venv/
+venv/
