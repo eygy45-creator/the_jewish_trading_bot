@@ -1,0 +1,10 @@
+data/raw/
+data/parsed/
+reports/
+runs/
+*.ndjson
+*.csv
+*.joblib
+__pycache__/
+*.pyc
+.venv/

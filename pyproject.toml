@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "the-jewish-trading-bot"
+version = "0.1.0"
+description = "Research-first microstructure futures framework (MNQ Milestone 1 skeleton)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "joblib>=1.3",
+  "pandas>=2.1",
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "scikit-learn>=1.4",
+  "structlog>=24.1",
+  "streamlit>=1.32",
+  "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.1",
+  "ruff>=0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
