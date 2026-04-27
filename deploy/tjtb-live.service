@@ -1,0 +1,24 @@
+[Unit]
+Description=TJTB live paper crypto (tjtb.live.live_paper_crypto)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=%h/the_jewish_trading_bot/the_jewish_trading_bot
+Environment=PYTHONPATH=src
+Environment=TJTB_HEARTBEAT_SEC=30
+ExecStart=%h/the_jewish_trading_bot/the_jewish_trading_bot/venv/bin/python3 -m tjtb.live.live_paper_crypto
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tjtb-live
+
+[Install]
+WantedBy=multi-user.target

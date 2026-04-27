@@ -1,3 +1,3 @@
 """Live orchestration (Milestone 3+)."""
 
-# TODO: process supervision, heartbeat, graceful shutdown, state persistence.
+# Production: systemd unit `deploy/tjtb-live.service`; heartbeat + singleton lock in live_paper_crypto.

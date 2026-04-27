@@ -9,9 +9,13 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import fcntl
 import json
 import logging
 import math
+import os
+import signal
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -25,8 +29,11 @@ from tjtb.features.build_features import parse_ts_to_unix
 RAW_GLOB = "coinbase_*.ndjson"
 RAW_DIR = Path("data/raw")
 LIVE_DIR = Path("data/live")
-REPORT_PATH = Path("reports/live_status.json")
-LOG_PATH = Path("logs/live_paper.log")
+REPORTS_DIR = Path("reports")
+REPORT_PATH = REPORTS_DIR / "live_status.json"
+LOG_PATH = Path("logs/live.log")
+HEARTBEAT_PATH = Path("logs/heartbeat.txt")
+LOCK_PATH = Path("logs/tjtb-live.lock")
 OPP_PATH = LIVE_DIR / "opportunities.csv"
 TRADES_PATH = LIVE_DIR / "paper_trades.csv"
 
@@ -40,8 +47,40 @@ TIMEOUT_SEC = 2.0
 EPS = 1e-9
 
 
+def _ensure_runtime_dirs() -> None:
+    for d in (RAW_DIR, LIVE_DIR, REPORTS_DIR, LOG_PATH.parent):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _try_acquire_singleton_lock(logger: logging.Logger) -> object | None:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_PATH, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.warning("another instance holds %s; exiting", LOCK_PATH)
+        fh.close()
+        return None
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def _start_heartbeat(interval_sec: float, stop: threading.Event) -> threading.Thread:
+    def _run() -> None:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        while not stop.wait(timeout=max(interval_sec, 1.0)):
+            HEARTBEAT_PATH.write_text(_utc_now() + "\n", encoding="utf-8")
+
+    t = threading.Thread(target=_run, name="tjtb-heartbeat", daemon=True)
+    t.start()
+    return t
+
+
 def _setup_logger() -> logging.Logger:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_runtime_dirs()
     logger = logging.getLogger("tjtb.live.paper")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -629,18 +668,51 @@ class LivePaperEngine:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Live paper trading loop on Coinbase BTCUSD raw NDJSON")
     parser.add_argument("--sleep-sec", type=float, default=1.0)
+    parser.add_argument(
+        "--heartbeat-sec",
+        type=float,
+        default=float(os.environ.get("TJTB_HEARTBEAT_SEC", "30")),
+        help="Write ISO UTC timestamp to logs/heartbeat.txt at this interval.",
+    )
     args = parser.parse_args(argv)
 
     logger = _setup_logger()
-    engine = LivePaperEngine(logger)
-    logger.info("live paper loop started")
-    try:
-        while True:
-            engine.loop_once()
-            time.sleep(max(args.sleep_sec, 0.1))
-    except KeyboardInterrupt:
-        logger.info("live paper loop stopped by user")
+    lock_fh = _try_acquire_singleton_lock(logger)
+    if lock_fh is None:
         return 0
+
+    stop = threading.Event()
+    hb_interval = max(args.heartbeat_sec, 1.0)
+    HEARTBEAT_PATH.write_text(_utc_now() + "\n", encoding="utf-8")
+    _start_heartbeat(hb_interval, stop)
+
+    shutdown = threading.Event()
+
+    def _request_shutdown(signum: int, frame: object | None) -> None:
+        shutdown.set()
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
+    engine = LivePaperEngine(logger)
+    logger.info("live paper loop started (pid=%s)", os.getpid())
+    try:
+        while not shutdown.is_set():
+            engine.loop_once()
+            if shutdown.wait(timeout=max(args.sleep_sec, 0.1)):
+                break
+    except KeyboardInterrupt:
+        shutdown.set()
+    finally:
+        stop.set()
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fh.close()
+
+    logger.info("live paper loop stopped")
+    return 0
 
 
 if __name__ == "__main__":
