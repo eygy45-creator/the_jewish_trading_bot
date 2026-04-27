@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-TRADES_PATH = Path("data/live/paper_trades.csv")
+# dashboard/ -> project root -> src on path (works without PYTHONPATH when layout is standard)
+_ROOT = Path(__file__).resolve().parent.parent
+_SRC = _ROOT / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from tjtb.runtime_paths import (  # noqa: E402
+    OPPORTUNITIES_PATH,
+    PAPER_TRADES_PATH,
+    PROJECT_ROOT,
+)
+
 REFRESH_MS = 5000
 
-EXPECTED_COLS = [
+EXPECTED_TRADE_COLS = [
     "entry_ts",
     "exit_ts",
     "side",
@@ -17,6 +30,16 @@ EXPECTED_COLS = [
     "outcome",
     "r_value",
     "regime",
+]
+
+EXPECTED_OPP_COLS = [
+    "ts",
+    "anomaly_percentile",
+    "anomaly_score",
+    "direction",
+    "regime",
+    "action",
+    "reason",
 ]
 
 
@@ -36,25 +59,86 @@ def _enable_autorefresh() -> None:
     )
 
 
-def load_paper_trades(path: Path) -> pd.DataFrame:
-    """Read-only load of paper trades CSV; returns empty DataFrame if missing/unreadable."""
+def _file_mtime_iso(path: Path) -> str | None:
     if not path.is_file():
-        return pd.DataFrame(columns=EXPECTED_COLS)
+        return None
+    try:
+        ts = path.stat().st_mtime
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except OSError:
+        return None
+
+
+def _file_size_bytes(path: Path) -> int | None:
+    if not path.is_file():
+        return None
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return None
+
+
+def _csv_data_row_count(path: Path) -> int | None:
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            n = sum(1 for _ in f)
+    except OSError:
+        return None
+    if n <= 0:
+        return 0
+    return max(0, n - 1)
+
+
+def _render_path_card(label: str, path: Path) -> None:
+    st.markdown(f"**{label}**")
+    st.code(str(path.resolve()), language="text")
+    exists = path.is_file()
+    if not exists:
+        st.warning(f"Missing: `{path.name}`")
+        return
+    rows = _csv_data_row_count(path)
+    mtime = _file_mtime_iso(path)
+    size_b = _file_size_bytes(path)
+    st.caption(
+        f"Rows (excl. header): **{rows}** · Last modified: **{mtime or '—'}** · Size: **{size_b}** bytes"
+    )
+
+
+def load_paper_trades(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        return pd.DataFrame(columns=EXPECTED_TRADE_COLS)
     try:
         df = pd.read_csv(path, encoding="utf-8")
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-        return pd.DataFrame(columns=EXPECTED_COLS)
+        return pd.DataFrame(columns=EXPECTED_TRADE_COLS)
     if df.empty:
-        return pd.DataFrame(columns=EXPECTED_COLS)
-    for c in EXPECTED_COLS:
+        return pd.DataFrame(columns=EXPECTED_TRADE_COLS)
+    for c in EXPECTED_TRADE_COLS:
         if c not in df.columns:
             df[c] = pd.NA
-    df = df[EXPECTED_COLS].copy()
+    df = df[EXPECTED_TRADE_COLS].copy()
     for c in ("entry_price", "exit_price", "r_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["r_value"])
     df["_exit_ts"] = pd.to_datetime(df["exit_ts"], utc=True, errors="coerce")
     return df
+
+
+def load_opportunities(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+    try:
+        df = pd.read_csv(path, encoding="utf-8")
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+    if df.empty:
+        return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+    for c in EXPECTED_OPP_COLS:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df[EXPECTED_OPP_COLS].copy()
 
 
 def max_losing_streak_r(r_series: pd.Series) -> int:
@@ -81,9 +165,25 @@ def main() -> None:
     _enable_autorefresh()
 
     st.title("Live bot — paper trades (read-only)")
-    st.caption("Data source: `data/live/paper_trades.csv`. No orders or API calls.")
+    st.caption(
+        f"PROJECT_ROOT: `{PROJECT_ROOT}` — no orders or broker calls; CSV read only."
+    )
 
-    df = load_paper_trades(TRADES_PATH)
+    st.subheader("Canonical paths")
+    c1, c2 = st.columns(2)
+    with c1:
+        _render_path_card("Paper trades", PAPER_TRADES_PATH)
+    with c2:
+        _render_path_card("Opportunities", OPPORTUNITIES_PATH)
+
+    df = load_paper_trades(PAPER_TRADES_PATH)
+    opps = load_opportunities(OPPORTUNITIES_PATH)
+
+    st.subheader("Opportunities (read-only preview)")
+    if opps.empty:
+        st.info("No opportunity rows loaded (missing file, empty, or parse error).")
+    else:
+        st.dataframe(opps.tail(50), use_container_width=True, hide_index=True)
 
     if df.empty:
         st.info("No trades yet")

@@ -25,17 +25,20 @@ from statistics import mean
 from typing import Any
 
 from tjtb.features.build_features import parse_ts_to_unix
+from tjtb.runtime_paths import (
+    LOGS_DIR,
+    OPPORTUNITIES_PATH,
+    PAPER_TRADES_PATH,
+    RAW_DATA_DIR,
+    REPORTS_DIR,
+    ensure_runtime_dirs,
+)
 
 RAW_GLOB = "coinbase_*.ndjson"
-RAW_DIR = Path("data/raw")
-LIVE_DIR = Path("data/live")
-REPORTS_DIR = Path("reports")
 REPORT_PATH = REPORTS_DIR / "live_status.json"
-LOG_PATH = Path("logs/live.log")
-HEARTBEAT_PATH = Path("logs/heartbeat.txt")
-LOCK_PATH = Path("logs/tjtb-live.lock")
-OPP_PATH = LIVE_DIR / "opportunities.csv"
-TRADES_PATH = LIVE_DIR / "paper_trades.csv"
+LOG_PATH = LOGS_DIR / "live.log"
+HEARTBEAT_PATH = LOGS_DIR / "heartbeat.txt"
+LOCK_PATH = LOGS_DIR / "tjtb-live.lock"
 
 LOOKBACK_SEC = 15.0
 CALIBRATION_SEC = 300.0
@@ -48,8 +51,7 @@ EPS = 1e-9
 
 
 def _ensure_runtime_dirs() -> None:
-    for d in (RAW_DIR, LIVE_DIR, REPORTS_DIR, LOG_PATH.parent):
-        d.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_dirs()
 
 
 def _try_acquire_singleton_lock(logger: logging.Logger) -> object | None:
@@ -214,7 +216,7 @@ class IncrementalNDJSON:
         self.partial = ""
 
     def _latest_file(self) -> Path | None:
-        files = [p for p in RAW_DIR.glob(RAW_GLOB) if p.is_file()]
+        files = [p for p in RAW_DATA_DIR.glob(RAW_GLOB) if p.is_file()]
         if not files:
             return None
         files.sort(key=lambda p: p.stat().st_mtime)
@@ -300,7 +302,7 @@ class LivePaperEngine:
         self._curr_losing_streak = 0
 
         _write_csv_header(
-            OPP_PATH,
+            OPPORTUNITIES_PATH,
             [
                 "ts",
                 "anomaly_percentile",
@@ -312,7 +314,7 @@ class LivePaperEngine:
             ],
         )
         _write_csv_header(
-            TRADES_PATH,
+            PAPER_TRADES_PATH,
             [
                 "entry_ts",
                 "exit_ts",
@@ -445,7 +447,7 @@ class LivePaperEngine:
         else:
             self._curr_losing_streak = 0
         _append_csv(
-            TRADES_PATH,
+            PAPER_TRADES_PATH,
             [
                 rec["entry_ts"],
                 rec["exit_ts"],
@@ -650,7 +652,7 @@ class LivePaperEngine:
                     self.trades_blocked += 1
                     self.trades_blocked_by_reason[reason] = self.trades_blocked_by_reason.get(reason, 0) + 1
                 _append_csv(
-                    OPP_PATH,
+                    OPPORTUNITIES_PATH,
                     [
                         top.ts_text,
                         pct,
