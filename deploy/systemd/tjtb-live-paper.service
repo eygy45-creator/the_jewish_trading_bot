@@ -1,0 +1,25 @@
+[Unit]
+Description=TJTB live paper trading loop (tjtb.live.live_paper_crypto)
+After=network-online.target tjtb-coinbase-recorder.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot
+Environment=PYTHONPATH=src
+Environment=TJTB_HEARTBEAT_SEC=30
+Environment=TJTB_DIAG_INTERVAL_SEC=30
+ExecStart=/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot/venv/bin/python3 -m tjtb.live.live_paper_crypto
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=15
+
+StandardOutput=append:/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot/logs/live_paper.systemd.log
+StandardError=append:/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot/logs/live_paper.systemd.log
+SyslogIdentifier=tjtb-live-paper
+
+[Install]
+WantedBy=multi-user.target

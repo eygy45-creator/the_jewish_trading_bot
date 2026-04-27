@@ -1,0 +1,23 @@
+[Unit]
+Description=TJTB Streamlit paper-trading dashboard (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot
+Environment=PYTHONPATH=src
+ExecStart=/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot/venv/bin/streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=15
+
+StandardOutput=append:/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot/logs/dashboard.systemd.log
+StandardError=append:/home/ubuntu/the_jewish_trading_bot/the_jewish_trading_bot/logs/dashboard.systemd.log
+SyslogIdentifier=tjtb-dashboard
+
+[Install]
+WantedBy=multi-user.target
