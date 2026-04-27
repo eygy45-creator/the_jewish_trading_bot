@@ -1,25 +1,33 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-# dashboard/ -> project root -> src on path (works without PYTHONPATH when layout is standard)
 _ROOT = Path(__file__).resolve().parent.parent
 _SRC = _ROOT / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from tjtb.runtime_paths import (  # noqa: E402
+    DASHBOARD_LOG_PATH,
+    HEARTBEAT_PATH,
+    LIVE_BOT_LOG_PATH,
     OPPORTUNITIES_PATH,
     PAPER_TRADES_PATH,
     PROJECT_ROOT,
+    RAW_DATA_DIR,
 )
 
 REFRESH_MS = 5000
+RAW_NDJSON_GLOB = "coinbase_*.ndjson"
+HEARTBEAT_STALE_SEC = float(os.environ.get("TJTB_HEARTBEAT_STALE_SEC", "90"))
 
 EXPECTED_TRADE_COLS = [
     "entry_ts",
@@ -59,6 +67,25 @@ def _enable_autorefresh() -> None:
     )
 
 
+def _pgrep_f(pat: str) -> bool:
+    r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+    return r.returncode == 0 and bool((r.stdout or "").strip())
+
+
+def _port_8501_open() -> bool:
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", 8501))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def _file_mtime_iso(path: Path) -> str | None:
     if not path.is_file():
         return None
@@ -91,19 +118,46 @@ def _csv_data_row_count(path: Path) -> int | None:
     return max(0, n - 1)
 
 
-def _render_path_card(label: str, path: Path) -> None:
+def _heartbeat_age_sec() -> float | None:
+    if not HEARTBEAT_PATH.is_file():
+        return None
+    try:
+        txt = HEARTBEAT_PATH.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        if not txt:
+            return None
+        ts = datetime.fromisoformat(txt[0].strip().replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(tz=timezone.utc) - ts).total_seconds())
+    except (ValueError, OSError):
+        return None
+
+
+def _raw_feed_status() -> tuple[str, int, float | None, str | None]:
+    files = [p for p in RAW_DATA_DIR.glob(RAW_NDJSON_GLOB) if p.is_file()]
+    if not files:
+        return "NO_FEED", 0, None, None
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    age = time.time() - latest.stat().st_mtime
+    state = "STALE" if age > 120.0 else "OK"
+    return state, len(files), age, latest.name
+
+
+def _render_path_card(label: str, path: Path) -> tuple[int | None, bool]:
+    """Returns (row_count_or_none, exists)."""
     st.markdown(f"**{label}**")
     st.code(str(path.resolve()), language="text")
     exists = path.is_file()
     if not exists:
-        st.warning(f"Missing: `{path.name}`")
-        return
+        st.warning(f"Missing file: `{path.name}`")
+        return None, False
     rows = _csv_data_row_count(path)
     mtime = _file_mtime_iso(path)
     size_b = _file_size_bytes(path)
     st.caption(
         f"Rows (excl. header): **{rows}** · Last modified: **{mtime or '—'}** · Size: **{size_b}** bytes"
     )
+    return rows, True
 
 
 def load_paper_trades(path: Path) -> pd.DataFrame:
@@ -161,103 +215,150 @@ def max_drawdown_r(cumulative_r: pd.Series) -> float:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Paper Trades (Live)", layout="wide")
+    st.set_page_config(page_title="TJTB Live Paper Stack", layout="wide")
     _enable_autorefresh()
 
-    st.title("Live bot — paper trades (read-only)")
+    st.title("Live paper stack (read-only)")
     st.caption(
-        f"PROJECT_ROOT: `{PROJECT_ROOT}` — no orders or broker calls; CSV read only."
+        f"PROJECT_ROOT = `{PROJECT_ROOT}` — paper CSVs + status only; **no orders**, no broker API."
     )
 
-    st.subheader("Canonical paths")
-    c1, c2 = st.columns(2)
+    live_on = _pgrep_f("tjtb.live.live_paper_crypto")
+    dash_on = _pgrep_f("streamlit run dashboard/app.py")
+    port_on = _port_8501_open()
+    hb_age = _heartbeat_age_sec()
+
+    st.subheader("Process & port status")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Live bot process", "RUNNING" if live_on else "STOPPED")
+    s2.metric("Dashboard process", "RUNNING" if dash_on else "STOPPED")
+    s3.metric("Port 8501 (localhost)", "LISTENING" if port_on else "closed")
+    s4.metric("Heartbeat age (sec)", f"{hb_age:.0f}" if hb_age is not None else "n/a")
+
+    if hb_age is None:
+        st.warning("Heartbeat missing or unreadable — live bot may not be running or logs dir wrong.")
+    elif hb_age > HEARTBEAT_STALE_SEC:
+        st.warning(
+            f"Heartbeat is stale (~{hb_age:.0f}s > {HEARTBEAT_STALE_SEC:.0f}s) — bot hung, wrong path, or heartbeat thread stopped."
+        )
+
+    feed_state, n_ndjson, feed_age, latest_name = _raw_feed_status()
+    st.subheader("Recorder / feed (NDJSON tail)")
+    st.code(str(RAW_DATA_DIR.resolve()), language="text")
+    st.write(
+        f"Pattern `{RAW_NDJSON_GLOB}` · files={n_ndjson} · state=**{feed_state}** · latest_file={latest_name or '—'} · latest_age_sec={feed_age if feed_age is not None else '—'}"
+    )
+    if feed_state == "NO_FEED":
+        st.error("NO LIVE DATA FEED — no NDJSON files under data/raw. Start the recorder that writes `coinbase_*.ndjson`.")
+    elif feed_state == "STALE":
+        st.warning("NDJSON file(s) exist but look stale — recorder may have stopped.")
+
+    st.subheader("Canonical file paths")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        _render_path_card("Paper trades", PAPER_TRADES_PATH)
+        trade_rows, _ = _render_path_card("Paper trades CSV", PAPER_TRADES_PATH)
     with c2:
-        _render_path_card("Opportunities", OPPORTUNITIES_PATH)
+        opp_rows, _ = _render_path_card("Opportunities CSV", OPPORTUNITIES_PATH)
+    with c3:
+        st.markdown("**Heartbeat file**")
+        st.code(str(HEARTBEAT_PATH.resolve()), language="text")
+        if not HEARTBEAT_PATH.is_file():
+            st.warning("Missing heartbeat.txt")
+        else:
+            st.caption(
+                f"Last modified: **{_file_mtime_iso(HEARTBEAT_PATH) or '—'}** · Size: **{_file_size_bytes(HEARTBEAT_PATH)}** bytes · age_sec≈**{hb_age if hb_age is not None else '—'}**"
+            )
+
+    st.subheader("Log files (paths only)")
+    st.text(f"live_bot: {LIVE_BOT_LOG_PATH.resolve()}")
+    st.text(f"dashboard: {DASHBOARD_LOG_PATH.resolve()}")
+
+    if trade_rows is not None and trade_rows == 0:
+        st.warning("No paper trade rows yet (file may be header-only or empty). Strategy may be waiting for signals or feed.")
+    if opp_rows is not None and opp_rows == 0:
+        st.warning("No opportunity rows yet — no bearish 99pct signals logged to CSV, or bot not processing feed.")
 
     df = load_paper_trades(PAPER_TRADES_PATH)
     opps = load_opportunities(OPPORTUNITIES_PATH)
 
-    st.subheader("Opportunities (read-only preview)")
+    st.subheader("Opportunities table (newest at bottom of tail)")
     if opps.empty:
-        st.info("No opportunity rows loaded (missing file, empty, or parse error).")
+        st.info("No opportunity rows in memory (empty file or parse issue).")
     else:
-        st.dataframe(opps.tail(50), use_container_width=True, hide_index=True)
+        st.dataframe(opps, use_container_width=True, hide_index=True)
 
+    st.subheader("Paper trades table (newest first)")
     if df.empty:
-        st.info("No trades yet")
-        return
+        st.info("No closed trades loaded (no data rows with valid r_value).")
+    else:
+        display_cols = [
+            "exit_ts",
+            "entry_ts",
+            "side",
+            "entry_price",
+            "exit_price",
+            "outcome",
+            "r_value",
+            "regime",
+        ]
+        table = df.sort_values("_exit_ts", ascending=False, na_position="last")[display_cols].copy()
+        st.dataframe(table, use_container_width=True, hide_index=True)
 
-    chron = df.sort_values("_exit_ts", na_position="last", ascending=True)
-    r = chron["r_value"]
-    cum_r = r.cumsum()
-    wins = (r > 0).sum()
-    n = int(len(df))
-    total_r = float(r.sum())
-    win_rate = float(wins / n) if n else 0.0
-    avg_r = float(r.mean()) if n else 0.0
-    best_r = float(r.max()) if n else 0.0
-    worst_r = float(r.min()) if n else 0.0
-    mdd_r = max_drawdown_r(cum_r.reset_index(drop=True))
-    lose_streak = max_losing_streak_r(chron["r_value"].reset_index(drop=True))
+        chron = df.sort_values("_exit_ts", na_position="last", ascending=True)
+        r = chron["r_value"]
+        cum_r = r.cumsum()
+        wins = (r > 0).sum()
+        n = int(len(df))
+        total_r = float(r.sum())
+        win_rate = float(wins / n) if n else 0.0
+        avg_r = float(r.mean()) if n else 0.0
+        best_r = float(r.max()) if n else 0.0
+        worst_r = float(r.min()) if n else 0.0
+        mdd_r = max_drawdown_r(cum_r.reset_index(drop=True))
+        lose_streak = max_losing_streak_r(chron["r_value"].reset_index(drop=True))
 
-    st.subheader("Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c5, c6, c7, c8 = st.columns(4)
-    c1.metric("Total trades", f"{n:,}")
-    c2.metric("Realized PnL (R)", f"{total_r:,.3f}")
-    c3.metric("Win rate", f"{win_rate:.1%}")
-    c4.metric("Average R", f"{avg_r:,.3f}")
-    c5.metric("Best trade (R)", f"{best_r:,.3f}")
-    c6.metric("Worst trade (R)", f"{worst_r:,.3f}")
-    c7.metric("Max drawdown (R)", f"{mdd_r:,.3f}")
-    c8.metric("Max losing streak", f"{lose_streak:,}")
+        st.subheader("Summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c5, c6, c7, c8 = st.columns(4)
+        c1.metric("Total trades", f"{n:,}")
+        c2.metric("Realized PnL (R)", f"{total_r:,.3f}")
+        c3.metric("Win rate", f"{win_rate:.1%}")
+        c4.metric("Average R", f"{avg_r:,.3f}")
+        c5.metric("Best trade (R)", f"{best_r:,.3f}")
+        c6.metric("Worst trade (R)", f"{worst_r:,.3f}")
+        c7.metric("Max drawdown (R)", f"{mdd_r:,.3f}")
+        c8.metric("Max losing streak", f"{lose_streak:,}")
 
-    st.subheader("Cumulative equity (R)")
-    equity_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "equity_R": cum_r.values})
-    st.line_chart(equity_df, x="trade #", y="equity_R")
+        st.subheader("Cumulative equity (R)")
+        equity_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "equity_R": cum_r.values})
+        st.line_chart(equity_df, x="trade #", y="equity_R")
 
-    st.subheader("Trades (newest first)")
-    display_cols = [
-        "exit_ts",
-        "entry_ts",
-        "side",
-        "entry_price",
-        "exit_price",
-        "outcome",
-        "r_value",
-        "regime",
-    ]
-    table = df.sort_values("_exit_ts", ascending=False, na_position="last")[display_cols].copy()
-    st.dataframe(table, use_container_width=True, hide_index=True)
-
-    st.subheader("Breakdown")
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        st.markdown("**By outcome**")
-        oc = (
-            df.groupby("outcome", dropna=False)["r_value"]
-            .agg(trades="count", total_R="sum", avg_R="mean")
-            .sort_values("trades", ascending=False)
-        )
-        st.dataframe(oc, use_container_width=True)
-    with b2:
-        st.markdown("**By regime**")
-        rg = (
-            df.groupby("regime", dropna=False)["r_value"]
-            .agg(trades="count", total_R="sum", avg_R="mean")
-            .sort_values("trades", ascending=False)
-        )
-        st.dataframe(rg, use_container_width=True)
-    with b3:
-        st.markdown("**By side**")
-        sd = (
-            df.groupby("side", dropna=False)["r_value"]
-            .agg(trades="count", total_R="sum", avg_R="mean")
-            .sort_values("trades", ascending=False)
-        )
-        st.dataframe(sd, use_container_width=True)
+        st.subheader("Breakdown")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            st.markdown("**By outcome**")
+            oc = (
+                df.groupby("outcome", dropna=False)["r_value"]
+                .agg(trades="count", total_R="sum", avg_R="mean")
+                .sort_values("trades", ascending=False)
+            )
+            st.dataframe(oc, use_container_width=True)
+        with b2:
+            st.markdown("**By regime**")
+            rg = (
+                df.groupby("regime", dropna=False)["r_value"]
+                .agg(trades="count", total_R="sum", avg_R="mean")
+                .sort_values("trades", ascending=False)
+            )
+            st.dataframe(rg, use_container_width=True)
+        with b3:
+            st.markdown("**By side**")
+            sd = (
+                df.groupby("side", dropna=False)["r_value"]
+                .agg(trades="count", total_R="sum", avg_R="mean")
+                .sort_values("trades", ascending=False)
+            )
+            st.dataframe(sd, use_container_width=True)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ from typing import Any
 
 from tjtb.features.build_features import parse_ts_to_unix
 from tjtb.runtime_paths import (
+    HEARTBEAT_PATH,
+    LIVE_BOT_LOG_PATH,
     LOGS_DIR,
     OPPORTUNITIES_PATH,
     PAPER_TRADES_PATH,
@@ -36,8 +38,7 @@ from tjtb.runtime_paths import (
 
 RAW_GLOB = "coinbase_*.ndjson"
 REPORT_PATH = REPORTS_DIR / "live_status.json"
-LOG_PATH = LOGS_DIR / "live.log"
-HEARTBEAT_PATH = LOGS_DIR / "heartbeat.txt"
+LOG_PATH = LIVE_BOT_LOG_PATH
 LOCK_PATH = LOGS_DIR / "tjtb-live.lock"
 
 LOOKBACK_SEC = 15.0
@@ -300,6 +301,7 @@ class LivePaperEngine:
         self.equity_curve: list[float] = []
         self.max_losing_streak = 0
         self._curr_losing_streak = 0
+        self.opportunities_appended = 0
 
         _write_csv_header(
             OPPORTUNITIES_PATH,
@@ -423,6 +425,34 @@ class LivePaperEngine:
         }
         REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
         REPORT_PATH.write_text(json.dumps(status, indent=2, allow_nan=False), encoding="utf-8")
+
+    def feed_status(self) -> tuple[str, str | None, int, float | None]:
+        files = [p for p in RAW_DATA_DIR.glob(RAW_GLOB) if p.is_file()]
+        if not files:
+            return "NO_FEED", None, 0, None
+        latest = max(files, key=lambda p: p.stat().st_mtime)
+        age_sec = time.time() - latest.stat().st_mtime
+        if age_sec > 120.0:
+            return "STALE", latest.name, len(files), age_sec
+        return "OK", latest.name, len(files), age_sec
+
+    def describe_idle_reason(self) -> str:
+        st, _name, _n, age_sec = self.feed_status()
+        if st == "NO_FEED":
+            return "no_ndjson_feed_recorder_must_write_coinbase_ndjson_to_data_raw"
+        if st == "STALE":
+            return f"feed_stale_age_sec={age_sec:.0f}_check_recorder_process"
+        if self.open_trade is not None:
+            return f"position_open_side={self.open_trade.get('side', '')}"
+        if self.signals_seen == 0:
+            return "awaiting_bearish_anomaly_pct99_no_signal_yet"
+        if self.trades_blocked_by_reason:
+            parts = [
+                f"{k}:{v}"
+                for k, v in sorted(self.trades_blocked_by_reason.items(), key=lambda x: -x[1])[:6]
+            ]
+            return "signals_seen_blocks=" + ";".join(parts)
+        return "strategy_active_no_opportunity_row_this_tick"
 
     def _close_trade(self, exit_ts: str, exit_price: float, outcome: str, r_value: float) -> None:
         t = self.open_trade
@@ -663,8 +693,56 @@ class LivePaperEngine:
                         reason,
                     ],
                 )
+                self.opportunities_appended += 1
 
         self._write_status(current_regime, current_pct, self.last_mid)
+
+
+def _csv_body_row_count(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            n = sum(1 for _ in f)
+    except OSError:
+        return 0
+    return max(0, n - 1)
+
+
+def _log_periodic_diagnostic(logger: logging.Logger, engine: LivePaperEngine) -> None:
+    state, latest_name, nfiles, age_sec = engine.feed_status()
+    if state == "NO_FEED":
+        logger.warning(
+            "NO LIVE DATA FEED DETECTED — no %s files under %s (start the NDJSON recorder writing here).",
+            RAW_GLOB,
+            RAW_DATA_DIR,
+        )
+    elif state == "STALE":
+        logger.warning(
+            "FEED STALE — latest_ndjson=%s age_sec=%.0f (recorder may be stopped)",
+            latest_name,
+            age_sec or -1.0,
+        )
+    op_file = _csv_body_row_count(OPPORTUNITIES_PATH)
+    tr_file = _csv_body_row_count(PAPER_TRADES_PATH)
+    logger.info(
+        "DIAGNOSTIC ts=%s transport=file_ndjson feed=%s ndjson_files=%s latest_file=%s latest_age_sec=%s "
+        "raw_events=%s signals=%s opps_session_appends=%s opps_csv_rows=%s trades_closed_session=%s trades_csv_rows=%s "
+        "last_mid=%s idle_reason=%s",
+        _utc_now(),
+        state,
+        nfiles,
+        latest_name or "-",
+        f"{age_sec:.1f}" if age_sec is not None else "-",
+        engine.raw_events_seen,
+        engine.signals_seen,
+        engine.opportunities_appended,
+        op_file,
+        len(engine.closed_trades),
+        tr_file,
+        engine.last_mid if engine.last_mid is not None else "-",
+        engine.describe_idle_reason(),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -675,6 +753,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=float(os.environ.get("TJTB_HEARTBEAT_SEC", "30")),
         help="Write ISO UTC timestamp to logs/heartbeat.txt at this interval.",
+    )
+    parser.add_argument(
+        "--diag-interval-sec",
+        type=float,
+        default=float(os.environ.get("TJTB_DIAG_INTERVAL_SEC", "30")),
+        help="Periodic DIAGNOSTIC log interval (feed, counts, idle reason).",
     )
     args = parser.parse_args(argv)
 
@@ -698,9 +782,16 @@ def main(argv: list[str] | None = None) -> int:
 
     engine = LivePaperEngine(logger)
     logger.info("live paper loop started (pid=%s)", os.getpid())
+    diag_interval = max(args.diag_interval_sec, 5.0)
+    last_diag = time.monotonic()
+    _log_periodic_diagnostic(logger, engine)
     try:
         while not shutdown.is_set():
             engine.loop_once()
+            now = time.monotonic()
+            if now - last_diag >= diag_interval:
+                last_diag = now
+                _log_periodic_diagnostic(logger, engine)
             if shutdown.wait(timeout=max(args.sleep_sec, 0.1)):
                 break
     except KeyboardInterrupt:

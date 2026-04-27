@@ -1,3 +1,3 @@
 """Live orchestration (Milestone 3+)."""
 
-# Production: systemd unit `deploy/tjtb-live.service`; heartbeat + singleton lock in live_paper_crypto.
+# Ops: `deploy/tjtb-live.service`, `bash scripts/live_stack.sh`, `PYTHONPATH=src python3 scripts/diagnostics/full_check.py`.

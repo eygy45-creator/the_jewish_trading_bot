@@ -23,6 +23,9 @@ REPORTS_DIR: Path = PROJECT_ROOT / "reports"
 LOGS_DIR: Path = PROJECT_ROOT / "logs"
 PAPER_TRADES_PATH: Path = LIVE_DATA_DIR / "paper_trades.csv"
 OPPORTUNITIES_PATH: Path = LIVE_DATA_DIR / "opportunities.csv"
+HEARTBEAT_PATH: Path = LOGS_DIR / "heartbeat.txt"
+LIVE_BOT_LOG_PATH: Path = LOGS_DIR / "live_bot.log"
+DASHBOARD_LOG_PATH: Path = LOGS_DIR / "dashboard.log"
 
 
 def ensure_runtime_dirs() -> None:
