@@ -25,7 +25,6 @@ from tjtb.runtime_paths import (  # noqa: E402
     RAW_DATA_DIR,
 )
 
-REFRESH_MS = 5000
 RAW_NDJSON_GLOB = "coinbase_*.ndjson"
 HEARTBEAT_STALE_SEC = float(os.environ.get("TJTB_HEARTBEAT_STALE_SEC", "90"))
 
@@ -49,22 +48,6 @@ EXPECTED_OPP_COLS = [
     "action",
     "reason",
 ]
-
-
-def _enable_autorefresh() -> None:
-    if hasattr(st, "autorefresh"):
-        st.autorefresh(interval=REFRESH_MS, key="tjtb-paper-refresh")
-        return
-    st.components.v1.html(
-        f"""
-        <script>
-            setTimeout(function() {{
-                window.parent.location.reload();
-            }}, {REFRESH_MS});
-        </script>
-        """,
-        height=0,
-    )
 
 
 def _pgrep_f(pat: str) -> bool:
@@ -216,7 +199,28 @@ def max_drawdown_r(cumulative_r: pd.Series) -> float:
 
 def main() -> None:
     st.set_page_config(page_title="TJTB Live Paper Stack", layout="wide")
-    _enable_autorefresh()
+
+    with st.sidebar:
+        st.header("Refresh")
+        st.checkbox("Auto refresh", value=False, key="tjtb_auto_refresh")
+        st.number_input(
+            "Refresh interval (seconds)",
+            min_value=5,
+            max_value=300,
+            value=30,
+            step=1,
+            key="tjtb_refresh_interval_sec",
+            help="When auto refresh is on, the app reruns on this interval (Streamlit autorefresh → full rerun).",
+        )
+        if st.button("Refresh now", key="tjtb_manual_refresh"):
+            st.rerun()
+
+    auto_on = bool(st.session_state.get("tjtb_auto_refresh", False))
+    interval_sec = int(st.session_state.get("tjtb_refresh_interval_sec", 30))
+    interval_sec = max(5, min(300, interval_sec))
+
+    if auto_on and hasattr(st, "autorefresh"):
+        st.autorefresh(interval=interval_sec * 1000, key=f"tjtb_autorefresh_{interval_sec}")
 
     st.title("Live paper stack (read-only)")
     st.caption(
@@ -359,6 +363,16 @@ def main() -> None:
                 .sort_values("trades", ascending=False)
             )
             st.dataframe(sd, use_container_width=True)
+
+    refreshed_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    st.session_state["tjtb_last_refreshed_at"] = refreshed_at
+
+    with st.sidebar:
+        st.divider()
+        st.caption("Last refreshed at")
+        st.write(st.session_state["tjtb_last_refreshed_at"])
+        if auto_on and not hasattr(st, "autorefresh"):
+            st.warning("Auto refresh needs `st.autorefresh` (newer Streamlit). Use **Refresh now** or upgrade Streamlit.")
 
 
 if __name__ == "__main__":
