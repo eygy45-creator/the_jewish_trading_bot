@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # One-command live paper stack (bot + Streamlit). Paper only; no tmux required.
+# If invoked as `sh scripts/live_stack.sh`, re-exec under bash (dash: invalid option pipefail).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+THIS_SCRIPT="${SCRIPT_DIR}/live_stack.sh"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
@@ -25,6 +30,41 @@ mkdir -p "${PROJECT_ROOT}/logs"
 _live_running() { pgrep -f "tjtb.live.live_paper_crypto" >/dev/null 2>&1; }
 _dash_running() { pgrep -f "streamlit run dashboard/app.py" >/dev/null 2>&1; }
 
+_csv_data_rows() {
+  local f="$1"
+  if [[ ! -f "$f" ]]; then
+    echo "n/a (file missing)"
+    return
+  fi
+  local n
+  n=$(wc -l <"$f" | tr -d '[:space:]')
+  if (( n <= 1 )); then
+    echo "0"
+  else
+    echo "$((n - 1))"
+  fi
+}
+
+_heartbeat_status() {
+  local hb="${PROJECT_ROOT}/logs/heartbeat.txt"
+  if [[ ! -f "$hb" ]]; then
+    echo "heartbeat: exists=no path=${hb}"
+    return
+  fi
+  local now mt age
+  now=$(date +%s)
+  if mt=$(stat -c %Y "$hb" 2>/dev/null); then
+    :
+  elif mt=$(stat -f %m "$hb" 2>/dev/null); then
+    :
+  else
+    echo "heartbeat: exists=yes path=${hb} age_sec=unknown (stat failed)"
+    return
+  fi
+  age=$((now - mt))
+  echo "heartbeat: exists=yes path=${hb} age_sec=${age}"
+}
+
 _print_urls() {
   echo ""
   echo "=== Dashboard URLs ==="
@@ -36,6 +76,37 @@ _print_urls() {
   echo ""
 }
 
+_port_8501() {
+  if command -v ss >/dev/null 2>&1; then
+    if ss -tlnp 2>/dev/null | grep -qE ':8501\b'; then
+      echo "yes"
+    else
+      echo "no"
+    fi
+  elif command -v netstat >/dev/null 2>&1; then
+    if netstat -tlnp 2>/dev/null | grep -qE ':8501\b'; then
+      echo "yes"
+    else
+      echo "no"
+    fi
+  else
+    echo "unknown (install iproute2/ss)"
+  fi
+}
+
+_touch_stack_files() {
+  mkdir -p "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/data/live"
+  : >>"${PROJECT_ROOT}/logs/live_bot.log"
+  TJTB_ROOT="${PROJECT_ROOT}" "${PROJECT_ROOT}/venv/bin/python3" -c \
+'from datetime import datetime, timezone
+from pathlib import Path
+import os
+root = Path(os.environ["TJTB_ROOT"])
+p = root / "logs" / "heartbeat.txt"
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(datetime.now(timezone.utc).isoformat() + "\n")'
+}
+
 cmd="${1:-status}"
 
 case "${cmd}" in
@@ -45,18 +116,18 @@ case "${cmd}" in
     if _live_running; then echo "RUNNING"; else echo "STOPPED"; fi
     echo -n "dashboard (streamlit dashboard/app.py): "
     if _dash_running; then echo "RUNNING"; else echo "STOPPED"; fi
+    _heartbeat_status
+    echo -n "paper_trades.csv data rows (excl. header): "
+    _csv_data_rows "${PROJECT_ROOT}/data/live/paper_trades.csv"
+    echo -n "opportunities.csv data rows (excl. header): "
+    _csv_data_rows "${PROJECT_ROOT}/data/live/opportunities.csv"
     echo -n "port 8501 listening: "
-    if command -v ss >/dev/null 2>&1; then
-      if ss -tlnp 2>/dev/null | grep -q ':8501'; then echo "yes"; else echo "no"; fi
-    elif command -v netstat >/dev/null 2>&1; then
-      if netstat -tlnp 2>/dev/null | grep -q ':8501'; then echo "yes"; else echo "no"; fi
-    else
-      echo "unknown (install iproute2/ss)"
-    fi
+    _port_8501
     _print_urls
     echo "Logs: ${PROJECT_ROOT}/logs/live_bot.log  ${PROJECT_ROOT}/logs/dashboard.log"
     ;;
   start)
+    _touch_stack_files
     if _live_running; then echo "live bot already running"; else
       echo "starting live bot -> logs/live_bot.log"
       nohup "${PROJECT_ROOT}/venv/bin/python3" -m tjtb.live.live_paper_crypto \
@@ -73,7 +144,7 @@ case "${cmd}" in
       disown || true
     fi
     sleep 1
-    bash "${PROJECT_ROOT}/scripts/live_stack.sh" status
+    "${BASH:-/usr/bin/env bash}" "${THIS_SCRIPT}" status
     ;;
   stop)
     echo "stopping live bot (if running)..."
@@ -81,12 +152,12 @@ case "${cmd}" in
     echo "stopping dashboard (if running)..."
     pkill -f "streamlit run dashboard/app.py" 2>/dev/null || true
     sleep 1
-    bash "${PROJECT_ROOT}/scripts/live_stack.sh" status
+    "${BASH:-/usr/bin/env bash}" "${THIS_SCRIPT}" status
     ;;
   restart)
-    bash "${PROJECT_ROOT}/scripts/live_stack.sh" stop || true
+    "${BASH:-/usr/bin/env bash}" "${THIS_SCRIPT}" stop || true
     sleep 2
-    bash "${PROJECT_ROOT}/scripts/live_stack.sh" start
+    "${BASH:-/usr/bin/env bash}" "${THIS_SCRIPT}" start
     ;;
   logs)
     echo "== tail live_bot.log (last 80 lines) =="
