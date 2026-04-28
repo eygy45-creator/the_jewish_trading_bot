@@ -128,6 +128,12 @@ def _sample_latest_raw_keysets(max_objects: int = 500) -> dict[str, list[str]]:
     }
 
 
+def _missing_l2_update_keys(raw_keysets: dict[str, list[str]]) -> list[str]:
+    update_keys = set(raw_keysets.get("update_keys", []))
+    required = {"price_level", "new_quantity", "side"}
+    return sorted(required - update_keys)
+
+
 def _first_present(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     for col in candidates:
         if col in df.columns:
@@ -475,12 +481,6 @@ def export_trade_context(
         merged.loc[nearest_exit_idx, "row_phase"] = "exit"
 
     merged = _ensure_required_columns(merged)
-    bidask_missing_in_raw = ("bid" not in raw_keys) and ("ask" not in raw_keys)
-    if bidask_missing_in_raw:
-        # Coinbase market feed typically exposes L2 as updates(price_level/new_quantity/side),
-        # not direct bid/ask keys. Keep export schema stable with empty bid/ask columns.
-        for c in ("bid", "ask", "bid_size", "ask_size"):
-            merged[c] = pd.NA
     merged["ts"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     merged = merged.replace({pd.NA: None})
 
@@ -494,10 +494,11 @@ def export_trade_context(
         status_parts.append(f"missing_or_empty_fields={missing_micro}")
     if raw_keys:
         status_parts.append(f"raw_event_keys={sorted(raw_keys)}")
-    if bidask_missing_in_raw:
+    missing_l2_keys = _missing_l2_update_keys(raw_keysets)
+    if missing_l2_keys:
         status_parts.append(
-            "raw_keys_warning=bid/ask keys missing in Coinbase NDJSON;"
-            f" latest_keysets={raw_keysets}"
+            "raw_keys_warning=coinbase_l2_update_keys_missing;"
+            f" missing={missing_l2_keys}; latest_keysets={raw_keysets}"
         )
     status_message = "ok" if not status_parts else "; ".join(status_parts)
     return merged, output_path, status_message
