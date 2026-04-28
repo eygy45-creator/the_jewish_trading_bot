@@ -329,6 +329,24 @@ def main() -> None:
         )
         if st.button("Refresh now", key="tjtb_manual_refresh"):
             st.rerun()
+        st.divider()
+        st.markdown("**Trade context window (seconds)**")
+        st.number_input(
+            "Before entry",
+            min_value=0,
+            max_value=600,
+            value=30,
+            step=5,
+            key="tjtb_context_before_sec",
+        )
+        st.number_input(
+            "After exit",
+            min_value=0,
+            max_value=600,
+            value=30,
+            step=5,
+            key="tjtb_context_after_sec",
+        )
 
     auto_on = bool(st.session_state.get("tjtb_auto_refresh", False))
     interval_sec = int(st.session_state.get("tjtb_refresh_interval_sec", 30))
@@ -371,48 +389,6 @@ def main() -> None:
         st.error("NO LIVE DATA FEED — no NDJSON files under data/raw. Start the recorder that writes `coinbase_*.ndjson`.")
     elif feed_state == "STALE":
         st.warning("NDJSON file(s) exist but look stale — recorder may have stopped.")
-
-    st.subheader("Live opportunities & trades")
-    ocol, tcol = st.columns(2)
-    with ocol:
-        opp_preview, opp_preview_err = _read_csv_safe(OPPORTUNITIES_PATH)
-        if opp_preview_err is not None or opp_preview.empty:
-            st.warning(f"Could not load opportunities preview ({opp_preview_err or 'empty_file'})")
-        else:
-            for c in ("bid", "ask", "bid_size", "ask_size"):
-                if c not in opp_preview.columns:
-                    opp_preview[c] = pd.NA
-            opp_preview_cols = [c for c in ["ts", "anomaly_percentile", "anomaly_score", "direction", "regime", "action", "bid", "ask", "bid_size", "ask_size"] if c in opp_preview.columns]
-            st.caption(f"Showing latest 50 opportunities rows (total={len(opp_preview)})")
-            st.dataframe(opp_preview[opp_preview_cols].tail(50), use_container_width=True, hide_index=True)
-    with tcol:
-        trade_preview, trade_preview_err = _read_csv_safe(PAPER_TRADES_PATH)
-        if trade_preview_err is not None or trade_preview.empty:
-            st.warning(f"Could not load trades preview ({trade_preview_err or 'empty_file'})")
-        else:
-            for c in ("bid", "ask", "bid_size", "ask_size"):
-                if c not in trade_preview.columns:
-                    trade_preview[c] = pd.NA
-            trade_preview_cols = [
-                c
-                for c in [
-                    "exit_ts",
-                    "entry_ts",
-                    "side",
-                    "entry_price",
-                    "exit_price",
-                    "outcome",
-                    "r_value",
-                    "regime",
-                    "bid",
-                    "ask",
-                    "bid_size",
-                    "ask_size",
-                ]
-                if c in trade_preview.columns
-            ]
-            st.caption(f"Showing latest 50 trades rows (total={len(trade_preview)})")
-            st.dataframe(trade_preview[trade_preview_cols].tail(50), use_container_width=True, hide_index=True)
 
     st.subheader("Log files (paths only)")
     st.text(f"live_bot: {LIVE_BOT_LOG_PATH.resolve()}")
@@ -504,6 +480,7 @@ def main() -> None:
     st.subheader("Detailed Trade Analysis")
     context_df = pd.DataFrame()
     context_path: Path | None = None
+    context_msg: str | None = None
     selected_entry_ts = ""
     selected_exit_ts = ""
     try:
@@ -519,39 +496,64 @@ def main() -> None:
             selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
             selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
             selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
-            st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
+            before_sec = int(st.session_state.get("tjtb_context_before_sec", 30))
+            after_sec = int(st.session_state.get("tjtb_context_after_sec", 30))
+            if _HAS_TRADE_CONTEXT_EXPORTER and export_trade_context is not None and selected_entry_ts:
+                export_result = export_trade_context(
+                    entry_ts=selected_entry_ts,
+                    exit_ts=selected_exit_ts if selected_exit_ts else None,
+                    before_seconds=before_sec,
+                    after_seconds=after_sec,
+                )
+                if isinstance(export_result, tuple) and len(export_result) >= 3:
+                    context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
+                else:
+                    context_df, context_path = export_result
+                    context_msg = None
+                if context_msg:
+                    st.info(str(context_msg))
+                detailed_cols = [
+                    c
+                    for c in [
+                        "timestamp",
+                        "phase",
+                        "price",
+                        "bid",
+                        "ask",
+                        "bid_size",
+                        "ask_size",
+                        "volume",
+                        "buy_volume",
+                        "sell_volume",
+                        "delta",
+                        "imbalance",
+                        "microprice",
+                        "spread",
+                        "anomaly_score",
+                        "anomaly_percentile",
+                        "regime",
+                        "action",
+                        "raw_json",
+                    ]
+                    if c in context_df.columns
+                ]
+                st.caption(f"Selected trade event rows: **{len(context_df)}**")
+                st.dataframe(context_df[detailed_cols].head(1000), use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
     except Exception as exc:  # noqa: BLE001
         st.error(f"Detailed Trade Analysis error: {exc}")
 
     st.subheader("Trade Context Export")
-    st.caption("Full microstructure context: bid/ask, sizes, aggressive flow, imbalance, queue imbalance, microprice, spread, volatility, anomaly/regime/action.")
+    st.caption("Download the same event-level detailed trade context table shown above.")
     try:
         if not _HAS_TRADE_CONTEXT_EXPORTER or export_trade_context is None:
             st.info("Trade context exporter module is unavailable on this environment.")
         elif not selected_entry_ts:
             st.warning("Selected trade has no valid entry timestamp.")
         else:
-            export_result = export_trade_context(entry_ts=selected_entry_ts, exit_ts=selected_exit_ts if selected_exit_ts else None)
-            if isinstance(export_result, tuple) and len(export_result) >= 3:
-                context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
-            else:
-                context_df, context_path = export_result
-                context_msg = None
-            if context_msg:
-                st.info(str(context_msg))
-            required_preview_cols = [
-                "ts", "bid", "ask", "bid_size", "ask_size", "price", "size", "side", "buy_volume", "sell_volume",
-                "aggressive_buyers", "aggressive_sellers", "imbalance", "queue_imbalance", "microprice",
-                "spread", "volatility", "anomaly_score", "anomaly_percentile", "direction", "regime", "action", "row_phase",
-            ]
-            missing_preview = [c for c in required_preview_cols if c not in context_df.columns]
-            if missing_preview:
-                st.warning(f"Context preview missing columns: {missing_preview}")
-                st.info(f"Available columns: {list(context_df.columns)}")
-            preview_cols = [c for c in required_preview_cols if c in context_df.columns]
-            preview_df = context_df[preview_cols].copy() if preview_cols else context_df.copy()
-            st.caption(f"Selected trade context rows: **{len(context_df)}**")
-            st.dataframe(preview_df.head(500), use_container_width=True, hide_index=True)
+            if context_df.empty or context_path is None:
+                st.warning("Detailed event-level trade context is empty for the selected window.")
             st.download_button(
                 "Download selected trade full context CSV",
                 data=context_df.to_csv(index=False).encode("utf-8"),
@@ -583,9 +585,6 @@ def main() -> None:
         mime="text/csv",
         key="tjtb_download_opportunities_csv",
     )
-    for c in ("bid", "ask", "bid_size", "ask_size"):
-        if c not in opps.columns:
-            opps[c] = pd.NA
     opps_display_cols = [
         c
         for c in [
@@ -596,10 +595,6 @@ def main() -> None:
             "regime",
             "action",
             "reason",
-            "bid",
-            "ask",
-            "bid_size",
-            "ask_size",
         ]
         if c in opps.columns
     ]
