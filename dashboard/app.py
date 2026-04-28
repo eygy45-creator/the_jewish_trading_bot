@@ -136,6 +136,20 @@ def _missing_required_columns(df: pd.DataFrame, expected_cols: list[str]) -> lis
     return [c for c in expected_cols if c not in df.columns]
 
 
+def _parse_context_msg(msg: str | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not msg:
+        return out
+    for part in str(msg).split(";"):
+        token = part.strip()
+        if "=" in token:
+            k, v = token.split("=", 1)
+            out[k.strip()] = v.strip()
+        else:
+            out[token] = ""
+    return out
+
+
 def _opportunities_invalid(df: pd.DataFrame) -> bool:
     if df.empty:
         return True
@@ -496,51 +510,56 @@ def main() -> None:
             selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
             selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
             selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
+            # Always show selected trade summary row even if exporter fails.
+            st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
             before_sec = int(st.session_state.get("tjtb_context_before_sec", 30))
             after_sec = int(st.session_state.get("tjtb_context_after_sec", 30))
             if _HAS_TRADE_CONTEXT_EXPORTER and export_trade_context is not None and selected_entry_ts:
-                export_result = export_trade_context(
-                    entry_ts=selected_entry_ts,
-                    exit_ts=selected_exit_ts if selected_exit_ts else None,
-                    before_seconds=before_sec,
-                    after_seconds=after_sec,
-                )
-                if isinstance(export_result, tuple) and len(export_result) >= 3:
-                    context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
-                else:
-                    context_df, context_path = export_result
-                    context_msg = None
-                if context_msg:
-                    st.info(str(context_msg))
-                detailed_cols = [
-                    c
-                    for c in [
-                        "timestamp",
-                        "phase",
-                        "price",
-                        "bid",
-                        "ask",
-                        "bid_size",
-                        "ask_size",
-                        "volume",
-                        "buy_volume",
-                        "sell_volume",
-                        "delta",
-                        "imbalance",
-                        "microprice",
-                        "spread",
-                        "anomaly_score",
-                        "anomaly_percentile",
-                        "regime",
-                        "action",
-                        "raw_json",
+                try:
+                    export_result = export_trade_context(
+                        entry_ts=selected_entry_ts,
+                        exit_ts=selected_exit_ts if selected_exit_ts else None,
+                        before_seconds=before_sec,
+                        after_seconds=after_sec,
+                    )
+                    if isinstance(export_result, tuple) and len(export_result) >= 3:
+                        context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
+                    else:
+                        context_df, context_path = export_result
+                        context_msg = None
+                    if context_msg:
+                        st.info(str(context_msg))
+                    detailed_cols = [
+                        c
+                        for c in [
+                            "timestamp",
+                            "phase",
+                            "price",
+                            "bid",
+                            "ask",
+                            "bid_size",
+                            "ask_size",
+                            "volume",
+                            "buy_volume",
+                            "sell_volume",
+                            "delta",
+                            "imbalance",
+                            "microprice",
+                            "spread",
+                            "anomaly_score",
+                            "anomaly_percentile",
+                            "regime",
+                            "action",
+                            "raw_json",
+                        ]
+                        if c in context_df.columns
                     ]
-                    if c in context_df.columns
-                ]
-                st.caption(f"Selected trade event rows: **{len(context_df)}**")
-                st.dataframe(context_df[detailed_cols].head(1000), use_container_width=True, hide_index=True)
+                    st.caption(f"Selected trade event rows: **{len(context_df)}**")
+                    st.dataframe(context_df[detailed_cols].head(1000), use_container_width=True, hide_index=True)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Detailed Trade Analysis error: {exc}")
             else:
-                st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
+                st.warning("Trade context exporter unavailable.")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Detailed Trade Analysis error: {exc}")
 
@@ -554,6 +573,11 @@ def main() -> None:
         else:
             if context_df.empty or context_path is None:
                 st.warning("Detailed event-level trade context is empty for the selected window.")
+                msg_parts = _parse_context_msg(context_msg)
+                st.write(f"raw file used: `{msg_parts.get('raw_file_used', 'unknown')}`")
+                st.write(f"event count found: `{msg_parts.get('event_count_found', '0')}`")
+                st.write(f"raw keys detected: `{msg_parts.get('raw_event_keys', 'unknown')}`")
+                st.write(f"reason empty: `{msg_parts.get('reason_empty', 'unknown')}`")
             st.download_button(
                 "Download selected trade full context CSV",
                 data=context_df.to_csv(index=False).encode("utf-8"),
@@ -571,13 +595,9 @@ def main() -> None:
         st.warning("opportunities.csv schema/data invalid")
         st.info(f"Malformed opportunities.csv quarantined to `data/live/opportunities.bad.csv` ({quarantined_reason})")
     if opps_csv_err is not None:
-        st.warning("opportunities.csv schema/data invalid")
         st.info(f"opportunities.csv read status: {opps_csv_err}")
     elif (not opps_fallback_applied) and opps_missing_cols:
-        st.warning("opportunities.csv schema/data invalid")
-        st.info(f"Missing required columns: {opps_missing_cols}")
-    elif (not opps_fallback_applied) and (opps.empty or _opportunities_invalid(opps)):
-        st.warning("opportunities.csv schema/data invalid")
+        st.info(f"Missing expected columns: {opps_missing_cols}")
     st.download_button(
         "Download opportunities.csv",
         data=(opps.to_csv(index=False).encode("utf-8") if not opps.empty else b""),
@@ -599,7 +619,10 @@ def main() -> None:
         if c in opps.columns
     ]
     st.caption(f"opportunities.csv row count: **{len(opps)}**")
-    st.dataframe(opps[opps_display_cols].tail(50), use_container_width=True, hide_index=True)
+    if opps_display_cols:
+        st.dataframe(opps[opps_display_cols].tail(50), use_container_width=True, hide_index=True)
+    else:
+        st.warning("Could not render opportunities table: no expected columns found.")
 
     st.subheader("Paper trades table")
     if trades_csv_err is not None:
@@ -608,9 +631,6 @@ def main() -> None:
     elif trades_missing_cols:
         st.warning("paper_trades.csv schema/data invalid")
         st.info(f"Missing required columns: {trades_missing_cols}")
-    for c in ("bid", "ask", "bid_size", "ask_size"):
-        if c not in df.columns:
-            df[c] = pd.NA
     display_cols = [
         c
         for c in [

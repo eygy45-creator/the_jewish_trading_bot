@@ -12,6 +12,8 @@ import pandas as pd
 from tjtb.runtime_paths import LIVE_DATA_DIR, OPPORTUNITIES_PATH, PAPER_TRADES_PATH, RAW_DATA_DIR
 
 RAW_NDJSON_GLOB = "coinbase_*.ndjson"
+_TS_RE = re.compile(r'"(?:timestamp|local_ts)"\s*:\s*"([^"]+)"')
+_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"([^"]+)"')
 REQUIRED_EXPORT_COLUMNS = [
     "ts",
     "bid",
@@ -233,10 +235,24 @@ def _iter_json_objects(path: Path):
         return
 
 
-def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
+def _extract_line_ts_and_channel(line: str) -> tuple[pd.Timestamp | None, str | None]:
+    ts: pd.Timestamp | None = None
+    ts_match = _TS_RE.search(line)
+    if ts_match:
+        ts = _safe_ts(ts_match.group(1))
+    ch_match = _CHANNEL_RE.search(line)
+    channel = ch_match.group(1).lower() if ch_match else None
+    return ts, channel
+
+
+def _build_raw_context(
+    window: TradeWindow,
+    max_lines_scanned: int = 300_000,
+    max_events_output: int = 5_000,
+) -> tuple[pd.DataFrame, set[str], list[str], int, int, str]:
     files = _candidate_raw_files(window)
     if not files:
-        return pd.DataFrame(), set()
+        return pd.DataFrame(), set(), [], 0, 0, "no_candidate_files"
 
     bids: dict[float, float] = {}
     asks: dict[float, float] = {}
@@ -246,162 +262,138 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
     sell_count = 0
     rows: list[dict[str, Any]] = []
     raw_keys: set[str] = set()
+    used_files: list[str] = [p.name for p in files]
+    lines_scanned = 0
+    stopped_reason = "end_of_window"
 
     for path in files:
-        for obj in _iter_json_objects(path):
-            raw_keys.update(obj.keys())
-            channel = str(obj.get("channel", "")).lower()
-            events = obj.get("events")
-            if not isinstance(events, list):
-                continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    lines_scanned += 1
+                    if lines_scanned > max_lines_scanned:
+                        stopped_reason = "max_lines_scanned"
+                        break
 
-            if channel == "market_trades":
-                for ev in events:
-                    if not isinstance(ev, dict):
+                    ts_hint, channel_hint = _extract_line_ts_and_channel(line)
+                    if ts_hint is not None and ts_hint < window.start_ts:
                         continue
-                    raw_keys.update(ev.keys())
-                    trades = ev.get("trades")
-                    if not isinstance(trades, list):
+                    if ts_hint is not None and ts_hint > window.end_ts:
+                        stopped_reason = "after_ts_reached"
+                        break
+                    if channel_hint is not None and channel_hint in {"heartbeats", "subscriptions"}:
                         continue
-                    for tr in trades:
-                        if not isinstance(tr, dict):
+                    if channel_hint is not None and channel_hint != "l2_data":
+                        continue
+
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+
+                    raw_keys.update(obj.keys())
+                    channel = str(obj.get("channel", "")).lower()
+                    if channel in {"heartbeats", "subscriptions"}:
+                        continue
+                    if channel != "l2_data":
+                        continue
+                    events = obj.get("events")
+                    if not isinstance(events, list):
+                        continue
+
+                    for ev in events:
+                        if not isinstance(ev, dict):
                             continue
-                        raw_keys.update(tr.keys())
-                        ts = _pick_ts(tr)
-                        if ts is None:
-                            ts = _pick_ts(ev)
-                        if ts is None or ts < window.start_ts or ts > window.end_ts:
+                        ev_type = str(ev.get("type", "")).lower()
+                        if ev_type == "snapshot":
+                            bids.clear()
+                            asks.clear()
+                        updates = ev.get("updates")
+                        raw_keys.update(ev.keys())
+                        if not isinstance(updates, list):
                             continue
-                        side = str(tr.get("side", "")).lower()
-                        size = _safe_float(tr.get("size"))
-                        if size is None:
-                            size = _safe_float(tr.get("qty"))
-                        price = _safe_float(tr.get("price"))
-                        if size is None:
-                            continue
-                        if side in {"buy", "bid"}:
-                            buy_volume += size
-                            buy_count += 1
-                        elif side in {"sell", "ask", "offer"}:
-                            sell_volume += size
-                            sell_count += 1
-                        best_bid = max(bids.keys()) if bids else None
-                        best_ask = min(asks.keys()) if asks else None
-                        bid_sz = bids.get(best_bid, 0.0) if best_bid is not None else None
-                        ask_sz = asks.get(best_ask, 0.0) if best_ask is not None else None
-                        spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None and best_ask > best_bid) else None
-                        denom = (bid_sz or 0.0) + (ask_sz or 0.0)
-                        imbalance = (((bid_sz or 0.0) - (ask_sz or 0.0)) / denom) if denom > 0 else None
-                        microprice = (
-                            ((best_ask * (bid_sz or 0.0)) + (best_bid * (ask_sz or 0.0))) / denom
-                            if denom > 0 and best_bid is not None and best_ask is not None
-                            else None
-                        )
-                        rows.append(
-                            {
-                                "ts": ts,
-                                "bid": best_bid,
-                                "ask": best_ask,
-                                "bid_size": bid_sz,
-                                "ask_size": ask_sz,
-                                "price": price,
-                                "size": size,
-                                "side": side,
-                                "buy_volume": buy_volume,
-                                "sell_volume": sell_volume,
-                                "aggressive_buyers": buy_count,
-                                "aggressive_sellers": sell_count,
-                                "imbalance": imbalance,
-                                "queue_imbalance": imbalance,
-                                "microprice": microprice,
-                                "spread": spread,
-                                "raw_json": json.dumps(tr, ensure_ascii=True),
-                            }
-                        )
-                continue
+                        for up in updates:
+                            if not isinstance(up, dict):
+                                continue
+                            raw_keys.update(up.keys())
+                            ts = _pick_ts(up)
+                            if ts is None:
+                                continue
+                            side = str(up.get("side", "")).lower()
+                            if side == "offer":
+                                side = "ask"
+                            px = _safe_float(up.get("price_level"))
+                            if px is None:
+                                px = _safe_float(up.get("price"))
+                            qty = _safe_float(up.get("new_quantity"))
+                            if qty is None:
+                                qty = _safe_float(up.get("size"))
+                            if qty is None:
+                                qty = _safe_float(up.get("qty"))
+                            if side not in {"bid", "ask"} or px is None or qty is None:
+                                continue
 
-            if channel != "l2_data":
-                continue
+                            book = bids if side == "bid" else asks
+                            if qty <= 0:
+                                book.pop(px, None)
+                            else:
+                                book[px] = qty
 
-            for ev in events:
-                if not isinstance(ev, dict):
-                    continue
-                ev_type = str(ev.get("type", "")).lower()
-                if ev_type == "snapshot":
-                    bids.clear()
-                    asks.clear()
-                updates = ev.get("updates")
-                raw_keys.update(ev.keys())
-                if not isinstance(updates, list):
-                    continue
-                for up in updates:
-                    if not isinstance(up, dict):
-                        continue
-                    raw_keys.update(up.keys())
-                    ts = _pick_ts(up)
-                    if ts is None:
-                        continue
-                    side = str(up.get("side", "")).lower()
-                    if side == "offer":
-                        side = "ask"
-                    px = _safe_float(up.get("price_level"))
-                    if px is None:
-                        px = _safe_float(up.get("price"))
-                    qty = _safe_float(up.get("new_quantity"))
-                    if qty is None:
-                        qty = _safe_float(up.get("size"))
-                    if qty is None:
-                        qty = _safe_float(up.get("qty"))
-                    if side not in {"bid", "ask"} or px is None or qty is None:
-                        continue
-
-                    book = bids if side == "bid" else asks
-                    if qty <= 0:
-                        book.pop(px, None)
-                    else:
-                        book[px] = qty
-
-                    if ts < window.start_ts or ts > window.end_ts:
-                        continue
-                    best_bid = max(bids.keys()) if bids else None
-                    best_ask = min(asks.keys()) if asks else None
-                    if best_bid is not None and best_ask is not None and best_bid >= best_ask:
-                        continue
-                    bid_sz = bids.get(best_bid, 0.0) if best_bid is not None else None
-                    ask_sz = asks.get(best_ask, 0.0) if best_ask is not None else None
-                    bid_sz_f = float(bid_sz) if bid_sz is not None else 0.0
-                    ask_sz_f = float(ask_sz) if ask_sz is not None else 0.0
-                    denom = bid_sz_f + ask_sz_f
-                    imbalance = ((bid_sz_f - ask_sz_f) / denom) if denom > 0 else None
-                    microprice = ((best_ask * bid_sz_f) + (best_bid * ask_sz_f)) / denom if denom > 0 and best_bid is not None and best_ask is not None else None
-                    spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
-                    rows.append(
-                        {
-                            "ts": ts,
-                            "bid": best_bid,
-                            "ask": best_ask,
-                            "bid_size": bid_sz,
-                            "ask_size": ask_sz,
-                            "microprice": microprice,
-                            "spread": spread,
-                            "price": px,
-                            "size": qty,
-                            "side": side,
-                            "buy_volume": buy_volume,
-                            "sell_volume": sell_volume,
-                            "aggressive_buyers": buy_count,
-                            "aggressive_sellers": sell_count,
-                            "imbalance": imbalance,
-                            "queue_imbalance": imbalance,
-                            "raw_json": json.dumps(up, ensure_ascii=True),
-                        }
-                    )
+                            if ts < window.start_ts or ts > window.end_ts:
+                                continue
+                            best_bid = max(bids.keys()) if bids else None
+                            best_ask = min(asks.keys()) if asks else None
+                            if best_bid is not None and best_ask is not None and best_bid >= best_ask:
+                                continue
+                            bid_sz = bids.get(best_bid, 0.0) if best_bid is not None else None
+                            ask_sz = asks.get(best_ask, 0.0) if best_ask is not None else None
+                            bid_sz_f = float(bid_sz) if bid_sz is not None else 0.0
+                            ask_sz_f = float(ask_sz) if ask_sz is not None else 0.0
+                            denom = bid_sz_f + ask_sz_f
+                            imbalance = ((bid_sz_f - ask_sz_f) / denom) if denom > 0 else None
+                            microprice = ((best_ask * bid_sz_f) + (best_bid * ask_sz_f)) / denom if denom > 0 and best_bid is not None and best_ask is not None else None
+                            spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+                            rows.append(
+                                {
+                                    "ts": ts,
+                                    "bid": best_bid,
+                                    "ask": best_ask,
+                                    "bid_size": bid_sz,
+                                    "ask_size": ask_sz,
+                                    "microprice": microprice,
+                                    "spread": spread,
+                                    "price": px,
+                                    "size": qty,
+                                    "side": side,
+                                    "buy_volume": buy_volume,
+                                    "sell_volume": sell_volume,
+                                    "aggressive_buyers": buy_count,
+                                    "aggressive_sellers": sell_count,
+                                    "imbalance": imbalance,
+                                    "queue_imbalance": imbalance,
+                                    "raw_json": json.dumps(up, ensure_ascii=True),
+                                }
+                            )
+                            if len(rows) >= max_events_output:
+                                stopped_reason = "max_events_output"
+                                break
+                        if len(rows) >= max_events_output:
+                            break
+                    if len(rows) >= max_events_output:
+                        break
+            if stopped_reason in {"max_lines_scanned", "after_ts_reached", "max_events_output"}:
+                break
+        except OSError:
+            continue
 
     if not rows:
-        return pd.DataFrame(), raw_keys
+        return pd.DataFrame(), raw_keys, used_files, 0, lines_scanned, stopped_reason
     out = pd.DataFrame(rows)
     out = out.sort_values("ts", ascending=True).drop_duplicates(subset=["ts", "side", "price", "size"], keep="last")
-    return out.reset_index(drop=True), raw_keys
+    out = out.reset_index(drop=True)
+    return out, raw_keys, used_files, int(len(out)), lines_scanned, stopped_reason
 
 
 def _row_phase(ts: pd.Timestamp, window: TradeWindow) -> str:
@@ -438,8 +430,11 @@ def export_trade_context(
     exit_ts: str | None = None,
     before_seconds: int = 30,
     after_seconds: int = 30,
+    max_lines_scanned: int = 300_000,
+    max_events_output: int = 5_000,
     output_dir: Path | None = None,
     paper_trades_path: Path = PAPER_TRADES_PATH,
+    **_ignored: Any,
 ) -> tuple[pd.DataFrame, Path, str]:
     """
     Export per-trade context window CSV for dashboard download.
@@ -451,7 +446,11 @@ def export_trade_context(
         before_seconds=before_seconds,
         after_seconds=after_seconds,
     )
-    raw_df, raw_keys = _build_raw_context(window)
+    raw_df, raw_keys, used_files, raw_event_count, lines_scanned, stopped_reason = _build_raw_context(
+        window=window,
+        max_lines_scanned=max_lines_scanned,
+        max_events_output=max_events_output,
+    )
     raw_keysets = _sample_latest_raw_keysets()
     opp_df = _load_opportunities_for_window(window)
 
@@ -460,6 +459,12 @@ def export_trade_context(
         status_parts.append("raw microstructure context unavailable")
     if opp_df.empty:
         status_parts.append("opportunities context unavailable")
+    status_parts.append(f"raw_file_used={used_files[-1] if used_files else 'none'}")
+    status_parts.append(f"event_count_found={raw_event_count}")
+    status_parts.append(f"events_used={raw_event_count}")
+    status_parts.append(f"events_output={raw_event_count}")
+    status_parts.append(f"lines_scanned={lines_scanned}")
+    status_parts.append(f"stopped_reason={stopped_reason}")
 
     if raw_df.empty and not opp_df.empty:
         merged = opp_df.rename(columns={"timestamp": "ts"}).copy()
@@ -480,7 +485,8 @@ def export_trade_context(
     merged = merged.dropna(subset=["ts"]).sort_values("ts")
     merged["trade_ref"] = window.trade_ref
     merged["row_phase"] = merged["ts"].apply(lambda ts: _row_phase(ts, window))
-    price_for_vol = pd.to_numeric(merged.get("microprice"), errors="coerce")
+    microprice_col = merged["microprice"] if "microprice" in merged.columns else pd.Series(index=merged.index, dtype=float)
+    price_for_vol = pd.to_numeric(microprice_col, errors="coerce")
     ret = price_for_vol.pct_change(fill_method=None)
     merged["volatility"] = ret.rolling(window=20, min_periods=5).std()
     if not merged.empty:
@@ -513,5 +519,7 @@ def export_trade_context(
             "raw_keys_warning=coinbase_l2_update_keys_missing;"
             f" missing={missing_l2_keys}; latest_keysets={raw_keysets}"
         )
+    if merged.empty:
+        status_parts.append("reason_empty=no_events_in_window_or_unreconstructable_l2")
     status_message = "ok" if not status_parts else "; ".join(status_parts)
     return merged, output_path, status_message
