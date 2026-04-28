@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import csv
+import json
 import shutil
 import subprocess
 import sys
@@ -222,6 +223,114 @@ def _raw_feed_status() -> tuple[str, int, float | None, str | None]:
     return state, len(files), age, latest.name
 
 
+def _iter_ndjson_objects(path: Path):
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except OSError:
+        return
+
+
+def _load_l2_top_of_book() -> pd.DataFrame:
+    files = [p for p in RAW_DATA_DIR.glob(RAW_NDJSON_GLOB) if p.is_file()]
+    if not files:
+        return pd.DataFrame(columns=["ts", "bid", "ask", "bid_size", "ask_size"])
+    files = sorted(files, key=lambda p: p.stat().st_mtime)[-2:]
+    bids: dict[float, float] = {}
+    asks: dict[float, float] = {}
+    rows: list[dict[str, float | pd.Timestamp | None]] = []
+    for path in files:
+        for obj in _iter_ndjson_objects(path):
+            if str(obj.get("channel", "")).lower() != "l2_data":
+                continue
+            events = obj.get("events")
+            if not isinstance(events, list):
+                continue
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                if str(ev.get("type", "")).lower() == "snapshot":
+                    bids.clear()
+                    asks.clear()
+                updates = ev.get("updates")
+                if not isinstance(updates, list):
+                    continue
+                for up in updates:
+                    if not isinstance(up, dict):
+                        continue
+                    ts = pd.to_datetime(up.get("event_time"), utc=True, errors="coerce")
+                    if pd.isna(ts):
+                        continue
+                    side = str(up.get("side", "")).lower()
+                    if side == "offer":
+                        side = "ask"
+                    px = pd.to_numeric(up.get("price_level"), errors="coerce")
+                    qty = pd.to_numeric(up.get("new_quantity"), errors="coerce")
+                    if pd.isna(px) or pd.isna(qty) or side not in {"bid", "ask"}:
+                        continue
+                    px_f = float(px)
+                    qty_f = float(qty)
+                    book = bids if side == "bid" else asks
+                    if qty_f <= 0:
+                        book.pop(px_f, None)
+                    else:
+                        book[px_f] = qty_f
+                    best_bid = max(bids.keys()) if bids else None
+                    best_ask = min(asks.keys()) if asks else None
+                    if best_bid is None and best_ask is None:
+                        continue
+                    rows.append(
+                        {
+                            "ts": ts,
+                            "bid": best_bid,
+                            "ask": best_ask,
+                            "bid_size": bids.get(best_bid) if best_bid is not None else None,
+                            "ask_size": asks.get(best_ask) if best_ask is not None else None,
+                        }
+                    )
+    if not rows:
+        return pd.DataFrame(columns=["ts", "bid", "ask", "bid_size", "ask_size"])
+    out = pd.DataFrame(rows).sort_values("ts")
+    return out.drop_duplicates(subset=["ts"], keep="last")
+
+
+def _attach_bid_ask_by_ts(df: pd.DataFrame, ts_col: str, book_df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in ("bid", "ask", "bid_size", "ask_size"):
+        if c not in out.columns:
+            out[c] = pd.NA
+    if out.empty or book_df.empty or ts_col not in out.columns:
+        return out
+    left = out.copy()
+    left["_merge_ts"] = pd.to_datetime(left[ts_col], utc=True, errors="coerce")
+    left = left.sort_values("_merge_ts")
+    right = book_df.copy().sort_values("ts")
+    merged = pd.merge_asof(
+        left,
+        right.rename(columns={"ts": "_book_ts"}),
+        left_on="_merge_ts",
+        right_on="_book_ts",
+        direction="backward",
+        tolerance=pd.Timedelta(seconds=2),
+        suffixes=("", "_book"),
+    )
+    for c in ("bid", "ask", "bid_size", "ask_size"):
+        book_col = f"{c}_book"
+        if book_col in merged.columns:
+            merged[c] = merged[c].combine_first(merged[book_col])
+            merged = merged.drop(columns=[book_col])
+    return merged.drop(columns=["_merge_ts", "_book_ts"], errors="ignore")
+
+
 def _render_path_card(label: str, path: Path) -> tuple[int | None, bool]:
     """Returns (row_count_or_none, exists)."""
     st.markdown(f"**{label}**")
@@ -374,25 +483,40 @@ def main() -> None:
 
     st.subheader("Live opportunities & trades")
     ocol, tcol = st.columns(2)
+    l2_book_preview = _load_l2_top_of_book()
+    opp_preview, opp_preview_fallback = load_opportunities(OPPORTUNITIES_PATH)
+    trade_preview = load_paper_trades(PAPER_TRADES_PATH)
+    opp_preview = _attach_bid_ask_by_ts(opp_preview, "ts", l2_book_preview)
+    trade_preview = _attach_bid_ask_by_ts(trade_preview, "entry_ts", l2_book_preview)
     with ocol:
-        opp_preview, opp_preview_err = _read_csv_safe(OPPORTUNITIES_PATH)
-        if opp_preview_err is not None or opp_preview.empty:
-            st.warning(f"Could not load opportunities preview ({opp_preview_err or 'empty_file'})")
+        if opp_preview.empty:
+            st.warning("Could not load opportunities preview (empty_file)")
         else:
-            for c in ("bid", "ask", "bid_size", "ask_size"):
-                if c not in opp_preview.columns:
-                    opp_preview[c] = pd.NA
-            opp_preview_cols = [c for c in ["ts", "anomaly_percentile", "anomaly_score", "direction", "regime", "action", "bid", "ask", "bid_size", "ask_size"] if c in opp_preview.columns]
+            if opp_preview_fallback:
+                st.info("opportunities header fallback applied")
+            opp_preview_cols = [
+                c
+                for c in [
+                    "ts",
+                    "anomaly_percentile",
+                    "anomaly_score",
+                    "direction",
+                    "regime",
+                    "action",
+                    "reason",
+                    "bid",
+                    "ask",
+                    "bid_size",
+                    "ask_size",
+                ]
+                if c in opp_preview.columns
+            ]
             st.caption(f"Showing latest 50 opportunities rows (total={len(opp_preview)})")
             st.dataframe(opp_preview[opp_preview_cols].tail(50), use_container_width=True, hide_index=True)
     with tcol:
-        trade_preview, trade_preview_err = _read_csv_safe(PAPER_TRADES_PATH)
-        if trade_preview_err is not None or trade_preview.empty:
-            st.warning(f"Could not load trades preview ({trade_preview_err or 'empty_file'})")
+        if trade_preview.empty:
+            st.warning("Could not load trades preview (empty_file)")
         else:
-            for c in ("bid", "ask", "bid_size", "ask_size"):
-                if c not in trade_preview.columns:
-                    trade_preview[c] = pd.NA
             trade_preview_cols = [
                 c
                 for c in [
@@ -439,6 +563,9 @@ def main() -> None:
 
     df = load_paper_trades(PAPER_TRADES_PATH)
     opps, opps_fallback_applied = load_opportunities(OPPORTUNITIES_PATH)
+    l2_book = _load_l2_top_of_book()
+    opps = _attach_bid_ask_by_ts(opps, "ts", l2_book)
+    df = _attach_bid_ask_by_ts(df, "entry_ts", l2_book)
     opps_missing_cols = _missing_required_columns(opps, EXPECTED_OPP_COLS) if not opps.empty else []
     valid_trades = df[df.get("_valid_trade", pd.Series(False, index=df.index)).fillna(False)].copy() if not df.empty else df
     chron = valid_trades.sort_values("_exit_ts", na_position="last", ascending=True) if not valid_trades.empty else valid_trades
