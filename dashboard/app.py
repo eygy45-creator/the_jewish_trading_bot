@@ -24,6 +24,7 @@ from tjtb.runtime_paths import (  # noqa: E402
     PROJECT_ROOT,
     RAW_DATA_DIR,
 )
+from tjtb.reports.export_trade_context import export_trade_context  # noqa: E402
 
 RAW_NDJSON_GLOB = "coinbase_*.ndjson"
 HEARTBEAT_STALE_SEC = float(os.environ.get("TJTB_HEARTBEAT_STALE_SEC", "90"))
@@ -160,6 +161,7 @@ def load_paper_trades(path: Path) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["r_value"])
     df["_exit_ts"] = pd.to_datetime(df["exit_ts"], utc=True, errors="coerce")
+    df["_entry_ts"] = pd.to_datetime(df["entry_ts"], utc=True, errors="coerce")
     return df
 
 
@@ -307,6 +309,44 @@ def main() -> None:
         ]
         table = df.sort_values("_exit_ts", ascending=False, na_position="last")[display_cols].copy()
         st.dataframe(table, use_container_width=True, hide_index=True)
+
+        st.subheader("Trade Context Export")
+        trade_selector_df = df.sort_values("_entry_ts", ascending=False, na_position="last").reset_index(drop=True)
+        trade_selector_df["_trade_label"] = trade_selector_df.apply(
+            lambda r: (
+                f"entry={r.get('entry_ts', 'n/a')} | exit={r.get('exit_ts', 'n/a')} | "
+                f"side={r.get('side', 'n/a')} | outcome={r.get('outcome', 'n/a')} | R={r.get('r_value', 'n/a')}"
+            ),
+            axis=1,
+        )
+        selected_label = st.selectbox(
+            "Select a paper trade",
+            options=trade_selector_df["_trade_label"].tolist(),
+            index=0,
+            key="tjtb_trade_context_selector",
+        )
+        selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
+        selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
+        selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
+
+        if not selected_entry_ts:
+            st.warning("Selected trade has no valid entry timestamp.")
+        else:
+            try:
+                context_df, context_path = export_trade_context(
+                    entry_ts=selected_entry_ts,
+                    exit_ts=selected_exit_ts if selected_exit_ts else None,
+                )
+                st.caption(f"Export path: `{context_path.resolve()}` · rows: **{len(context_df)}**")
+                st.download_button(
+                    "Download trade context CSV",
+                    data=context_df.to_csv(index=False).encode("utf-8"),
+                    file_name=context_path.name,
+                    mime="text/csv",
+                    key=f"tjtb_download_trade_context_{selected_entry_ts}",
+                )
+            except ValueError as exc:
+                st.error(f"Could not export trade context: {exc}")
 
         chron = df.sort_values("_exit_ts", na_position="last", ascending=True)
         r = chron["r_value"]
