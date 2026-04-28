@@ -529,33 +529,32 @@ def main() -> None:
                         context_msg = None
                     if context_msg:
                         st.info(str(context_msg))
+                    st.markdown("### Event-level trade context: before / during / after")
+                    context_display = context_df.copy()
+                    if "ts" not in context_display.columns and "timestamp" in context_display.columns:
+                        context_display["ts"] = context_display["timestamp"]
                     detailed_cols = [
                         c
                         for c in [
-                            "timestamp",
                             "phase",
+                            "ts",
                             "price",
                             "bid",
                             "ask",
                             "bid_size",
                             "ask_size",
+                            "spread",
                             "volume",
                             "buy_volume",
                             "sell_volume",
                             "delta",
                             "imbalance",
-                            "microprice",
-                            "spread",
-                            "anomaly_score",
-                            "anomaly_percentile",
-                            "regime",
-                            "action",
                             "raw_json",
                         ]
-                        if c in context_df.columns
+                        if c in context_display.columns
                     ]
-                    st.caption(f"Selected trade event rows: **{len(context_df)}**")
-                    st.dataframe(context_df[detailed_cols].head(1000), use_container_width=True, hide_index=True)
+                    st.caption(f"Selected trade event rows: **{len(context_display)}**")
+                    st.dataframe(context_display[detailed_cols].head(1000), use_container_width=True, hide_index=True)
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Detailed Trade Analysis error: {exc}")
             else:
@@ -578,9 +577,32 @@ def main() -> None:
                 st.write(f"event count found: `{msg_parts.get('event_count_found', '0')}`")
                 st.write(f"raw keys detected: `{msg_parts.get('raw_event_keys', 'unknown')}`")
                 st.write(f"reason empty: `{msg_parts.get('reason_empty', 'unknown')}`")
+            context_export = context_df.copy()
+            if "ts" not in context_export.columns and "timestamp" in context_export.columns:
+                context_export["ts"] = context_export["timestamp"]
+            export_cols = [
+                c
+                for c in [
+                    "phase",
+                    "ts",
+                    "price",
+                    "bid",
+                    "ask",
+                    "bid_size",
+                    "ask_size",
+                    "spread",
+                    "volume",
+                    "buy_volume",
+                    "sell_volume",
+                    "delta",
+                    "imbalance",
+                    "raw_json",
+                ]
+                if c in context_export.columns
+            ]
             st.download_button(
                 "Download selected trade full context CSV",
-                data=context_df.to_csv(index=False).encode("utf-8"),
+                data=context_export[export_cols].to_csv(index=False).encode("utf-8") if export_cols else context_export.to_csv(index=False).encode("utf-8"),
                 file_name=context_path.name if context_path is not None else "trade_context.csv",
                 mime="text/csv",
                 key=f"tjtb_download_trade_context_{selected_entry_ts}",
