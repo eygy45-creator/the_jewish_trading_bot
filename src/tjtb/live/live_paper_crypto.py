@@ -40,6 +40,15 @@ RAW_GLOB = "coinbase_*.ndjson"
 REPORT_PATH = REPORTS_DIR / "live_status.json"
 LOG_PATH = LIVE_BOT_LOG_PATH
 LOCK_PATH = LOGS_DIR / "tjtb-live.lock"
+OPPORTUNITIES_HEADER = [
+    "ts",
+    "anomaly_percentile",
+    "anomaly_score",
+    "direction",
+    "regime",
+    "action",
+    "reason",
+]
 
 LOOKBACK_SEC = 15.0
 CALIBRATION_SEC = 300.0
@@ -134,6 +143,44 @@ def _write_csv_header(path: Path, header: list[str]) -> None:
 def _append_csv(path: Path, row: list[Any]) -> None:
     with path.open("a", encoding="utf-8", newline="") as f:
         csv.writer(f).writerow(row)
+
+
+def _ensure_opportunities_csv_schema(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.is_file() or path.stat().st_size <= 0:
+        with path.open("w", encoding="utf-8", newline="") as f:
+            csv.writer(f).writerow(OPPORTUNITIES_HEADER)
+        return
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+    except OSError:
+        header = []
+    if header == OPPORTUNITIES_HEADER:
+        return
+    bad_path = path.parent / "opportunities.bad.csv"
+    if bad_path.is_file():
+        bad_path.unlink()
+    path.replace(bad_path)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerow(OPPORTUNITIES_HEADER)
+
+
+def _append_opportunity_row(
+    ts: str,
+    anomaly_percentile: float,
+    anomaly_score: float,
+    direction: str,
+    regime: str,
+    action: str,
+    reason: str,
+) -> None:
+    _ensure_opportunities_csv_schema(OPPORTUNITIES_PATH)
+    _append_csv(
+        OPPORTUNITIES_PATH,
+        [ts, anomaly_percentile, anomaly_score, direction, regime, action, reason],
+    )
 
 
 @dataclass
@@ -303,18 +350,7 @@ class LivePaperEngine:
         self._curr_losing_streak = 0
         self.opportunities_appended = 0
 
-        _write_csv_header(
-            OPPORTUNITIES_PATH,
-            [
-                "ts",
-                "anomaly_percentile",
-                "anomaly_score",
-                "direction",
-                "regime",
-                "action",
-                "reason",
-            ],
-        )
+        _ensure_opportunities_csv_schema(OPPORTUNITIES_PATH)
         _write_csv_header(
             PAPER_TRADES_PATH,
             [
@@ -681,17 +717,14 @@ class LivePaperEngine:
                 else:
                     self.trades_blocked += 1
                     self.trades_blocked_by_reason[reason] = self.trades_blocked_by_reason.get(reason, 0) + 1
-                _append_csv(
-                    OPPORTUNITIES_PATH,
-                    [
-                        top.ts_text,
-                        pct,
-                        anomaly_score,
-                        direction,
-                        current_regime,
-                        action,
-                        reason,
-                    ],
+                _append_opportunity_row(
+                    ts=top.ts_text,
+                    anomaly_percentile=pct,
+                    anomaly_score=anomaly_score,
+                    direction=direction,
+                    regime=current_regime,
+                    action=action,
+                    reason=reason,
                 )
                 self.opportunities_appended += 1
 

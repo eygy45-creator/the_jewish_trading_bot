@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import csv
+import shutil
 import subprocess
 import sys
 import time
@@ -75,6 +77,46 @@ EXPECTED_OPP_COLS = [
     "action",
     "reason",
 ]
+
+
+def _quarantine_invalid_opportunities_csv(path: Path) -> tuple[bool, str | None]:
+    if not path.is_file():
+        return False, None
+    malformed = False
+    reason = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            if header != EXPECTED_OPP_COLS:
+                # Fallback case: file was written without header and first data row became "header".
+                # Keep file as-is so loader can read it with explicit names.
+                if len(header) == len(EXPECTED_OPP_COLS):
+                    return False, "headerless_7col_fallback"
+                malformed = True
+                reason = f"header_mismatch expected={EXPECTED_OPP_COLS} got={header}"
+            else:
+                for row in reader:
+                    if not row:
+                        continue
+                    if len(row) != len(EXPECTED_OPP_COLS):
+                        malformed = True
+                        reason = f"row_length_mismatch expected={len(EXPECTED_OPP_COLS)} got={len(row)}"
+                        break
+    except OSError as exc:
+        malformed = True
+        reason = f"read_error: {exc}"
+
+    if not malformed:
+        return False, None
+
+    bad_path = path.parent / "opportunities.bad.csv"
+    if bad_path.is_file():
+        bad_path.unlink()
+    shutil.move(str(path), str(bad_path))
+    with path.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerow(EXPECTED_OPP_COLS)
+    return True, reason
 
 
 def _read_csv_safe(path: Path) -> tuple[pd.DataFrame, str | None]:
@@ -225,9 +267,21 @@ def load_opportunities(path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=EXPECTED_OPP_COLS)
     if df.empty:
         return pd.DataFrame(columns=EXPECTED_OPP_COLS)
-    for c in EXPECTED_OPP_COLS:
-        if c not in df.columns:
-            df[c] = pd.NA
+    if any(c not in df.columns for c in EXPECTED_OPP_COLS):
+        # Header fallback: if file has 7 columns but no valid header,
+        # re-read treating all rows as data.
+        try:
+            df_fallback = pd.read_csv(
+                path,
+                encoding="utf-8",
+                header=None,
+                names=EXPECTED_OPP_COLS,
+            )
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+        if df_fallback.empty:
+            return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+        return df_fallback[EXPECTED_OPP_COLS].copy()
     return df[EXPECTED_OPP_COLS].copy()
 
 
@@ -348,6 +402,8 @@ def main() -> None:
     if opp_rows is not None and opp_rows == 0:
         st.warning("No opportunity rows yet — no bearish 99pct signals logged to CSV, or bot not processing feed.")
 
+    quarantined_opp, quarantined_reason = _quarantine_invalid_opportunities_csv(OPPORTUNITIES_PATH)
+
     raw_trades_csv, trades_csv_err = _read_csv_safe(PAPER_TRADES_PATH)
     raw_opps_csv, opps_csv_err = _read_csv_safe(OPPORTUNITIES_PATH)
     trades_missing_cols = _missing_required_columns(raw_trades_csv, EXPECTED_TRADE_COLS) if not raw_trades_csv.empty else []
@@ -387,6 +443,11 @@ def main() -> None:
     valid_trades = df[df.get("_valid_trade", pd.Series(False, index=df.index)).fillna(False)].copy() if not df.empty else df
 
     st.subheader("Opportunities table (newest at bottom of tail)")
+    if quarantined_reason == "headerless_7col_fallback":
+        st.warning("opportunities.csv missing header; applying 7-column fallback reader")
+    if quarantined_opp:
+        st.warning("opportunities.csv schema/data invalid")
+        st.info(f"Malformed opportunities.csv quarantined to `data/live/opportunities.bad.csv` ({quarantined_reason})")
     if opps_csv_err is not None:
         st.warning("opportunities.csv schema/data invalid")
         st.info(f"opportunities.csv read status: {opps_csv_err}")
