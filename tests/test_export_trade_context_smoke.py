@@ -73,10 +73,6 @@ def test_export_trade_context_includes_bid_ask_columns(tmp_path, monkeypatch):
     assert "bid_size" in out_df.columns
     assert "ask_size" in out_df.columns
     assert "raw_json" in out_df.columns
-    assert "timestamp" in out_df.columns
-    assert "phase" in out_df.columns
-    assert "volume" in out_df.columns
-    assert "delta" in out_df.columns
     assert out_df["bid"].notna().any() or out_df["ask"].notna().any()
 
 
@@ -138,5 +134,3 @@ def test_export_trade_context_warns_when_bidask_keys_missing(tmp_path, monkeypat
     assert out_df["bid_size"].isna().all()
     assert out_df["ask_size"].isna().all()
     assert "raw_keys_warning=" in msg
-    assert "timestamp" in out_df.columns
-    assert "phase" in out_df.columns

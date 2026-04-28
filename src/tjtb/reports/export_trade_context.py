@@ -145,7 +145,7 @@ def _sanitize_ts_for_filename(ts: str) -> str:
     return re.sub(r"[^0-9T]", "_", ts.strip())[:48]
 
 
-def _parse_trade_window(entry_ts: str, exit_ts: str | None = None, before_seconds: int = 30, after_seconds: int = 30) -> TradeWindow:
+def _parse_trade_window(entry_ts: str, exit_ts: str | None = None) -> TradeWindow:
     entry = _safe_ts(entry_ts)
     if entry is None:
         raise ValueError(f"Invalid entry timestamp: {entry_ts}")
@@ -157,8 +157,8 @@ def _parse_trade_window(entry_ts: str, exit_ts: str | None = None, before_second
     return TradeWindow(
         entry_ts=entry,
         exit_ts=exit_final,
-        start_ts=entry - timedelta(seconds=max(0, int(before_seconds))),
-        end_ts=exit_final + timedelta(seconds=max(0, int(after_seconds))),
+        start_ts=entry - timedelta(seconds=30),
+        end_ts=exit_final + timedelta(seconds=60),
         trade_ref=entry_ts,
     )
 
@@ -405,19 +405,17 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
 
 
 def _row_phase(ts: pd.Timestamp, window: TradeWindow) -> str:
+    if ts == window.entry_ts:
+        return "entry"
+    if ts == window.exit_ts:
+        return "exit"
     if ts < window.entry_ts:
-        return "before"
-    if ts > window.exit_ts:
-        return "after"
-    return "during"
+        return "before_entry"
+    return "after_entry"
 
 
 def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     wanted = REQUIRED_EXPORT_COLUMNS + [
-        "timestamp",
-        "phase",
-        "volume",
-        "delta",
         "aggressive_buyers",
         "aggressive_sellers",
         "queue_imbalance",
@@ -436,8 +434,6 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
 def export_trade_context(
     entry_ts: str,
     exit_ts: str | None = None,
-    before_seconds: int = 30,
-    after_seconds: int = 30,
     output_dir: Path | None = None,
     paper_trades_path: Path = PAPER_TRADES_PATH,
 ) -> tuple[pd.DataFrame, Path, str]:
@@ -445,12 +441,7 @@ def export_trade_context(
     Export per-trade context window CSV for dashboard download.
     """
     _ = paper_trades_path  # explicit dependency for compatibility with call-sites
-    window = _parse_trade_window(
-        entry_ts=entry_ts,
-        exit_ts=exit_ts,
-        before_seconds=before_seconds,
-        after_seconds=after_seconds,
-    )
+    window = _parse_trade_window(entry_ts=entry_ts, exit_ts=exit_ts)
     raw_df, raw_keys = _build_raw_context(window)
     raw_keysets = _sample_latest_raw_keysets()
     opp_df = _load_opportunities_for_window(window)
@@ -488,13 +479,9 @@ def export_trade_context(
         merged.loc[nearest_entry_idx, "row_phase"] = "entry"
         nearest_exit_idx = (merged["ts"] - window.exit_ts).abs().idxmin()
         merged.loc[nearest_exit_idx, "row_phase"] = "exit"
-    merged["phase"] = merged["row_phase"]
-    merged["volume"] = pd.to_numeric(merged.get("size"), errors="coerce")
-    merged["delta"] = pd.to_numeric(merged.get("buy_volume"), errors="coerce") - pd.to_numeric(merged.get("sell_volume"), errors="coerce")
 
     merged = _ensure_required_columns(merged)
-    merged["timestamp"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    merged["ts"] = merged["timestamp"]
+    merged["ts"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     merged = merged.replace({pd.NA: None})
 
     out_dir = output_dir or LIVE_DATA_DIR
