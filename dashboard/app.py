@@ -505,7 +505,35 @@ def main() -> None:
                 context_msg = None
             if context_msg:
                 st.info(str(context_msg))
-            st.dataframe(context_df.head(300), use_container_width=True, hide_index=True)
+            required_preview_cols = [
+                "timestamp",
+                "bid",
+                "ask",
+                "bid_size",
+                "ask_size",
+                "buy_volume",
+                "sell_volume",
+                "aggressive_buyers",
+                "aggressive_sellers",
+                "imbalance",
+                "queue_imbalance",
+                "microprice",
+                "spread",
+                "volatility",
+                "anomaly_score",
+                "anomaly_percentile",
+                "regime",
+                "action",
+                "row_phase",
+            ]
+            missing_preview = [c for c in required_preview_cols if c not in context_df.columns]
+            if missing_preview:
+                st.warning(f"Context preview missing columns: {missing_preview}")
+                st.info(f"Available columns: {list(context_df.columns)}")
+            preview_cols = [c for c in required_preview_cols if c in context_df.columns]
+            preview_df = context_df[preview_cols].copy() if preview_cols else context_df.copy()
+            st.caption(f"Selected trade context rows: **{len(context_df)}**")
+            st.dataframe(preview_df.head(500), use_container_width=True, hide_index=True)
             st.download_button(
                 "Download selected trade full context CSV",
                 data=context_df.to_csv(index=False).encode("utf-8"),
@@ -537,7 +565,8 @@ def main() -> None:
         mime="text/csv",
         key="tjtb_download_opportunities_csv",
     )
-    st.dataframe(opps, use_container_width=True, hide_index=True)
+    st.caption(f"opportunities.csv row count: **{len(opps)}**")
+    st.dataframe(opps.tail(50), use_container_width=True, hide_index=True)
 
     st.subheader("Paper trades table")
     if trades_csv_err is not None:

@@ -138,10 +138,10 @@ def _iter_json_objects(path: Path):
         return
 
 
-def _build_raw_context(window: TradeWindow) -> pd.DataFrame:
+def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
     files = _candidate_raw_files(window)
     if not files:
-        return pd.DataFrame()
+        return pd.DataFrame(), set()
 
     bids: dict[float, float] = {}
     asks: dict[float, float] = {}
@@ -150,9 +150,11 @@ def _build_raw_context(window: TradeWindow) -> pd.DataFrame:
     buy_count = 0
     sell_count = 0
     rows: list[dict[str, Any]] = []
+    raw_keys: set[str] = set()
 
     for path in files:
         for obj in _iter_json_objects(path):
+            raw_keys.update(obj.keys())
             channel = str(obj.get("channel", "")).lower()
             events = obj.get("events")
             if not isinstance(events, list):
@@ -249,10 +251,10 @@ def _build_raw_context(window: TradeWindow) -> pd.DataFrame:
                     )
 
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), raw_keys
     out = pd.DataFrame(rows)
     out = out.sort_values("timestamp", ascending=True).drop_duplicates(subset=["timestamp"], keep="last")
-    return out.reset_index(drop=True)
+    return out.reset_index(drop=True), raw_keys
 
 
 def _row_phase(ts: pd.Timestamp, window: TradeWindow) -> str:
@@ -270,6 +272,8 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
         "timestamp",
         "best_bid",
         "best_ask",
+        "bid",
+        "ask",
         "bid_size",
         "ask_size",
         "mid_price",
@@ -277,11 +281,14 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
         "spread",
         "buy_volume",
         "aggressive_buy_count",
+        "aggressive_buyers",
         "sell_volume",
         "aggressive_sell_count",
+        "aggressive_sellers",
         "imbalance",
         "queue_imbalance",
         "volatility_context",
+        "volatility",
         "anomaly_score",
         "anomaly_percentile",
         "direction",
@@ -308,7 +315,7 @@ def export_trade_context(
     """
     _ = paper_trades_path  # explicit dependency for compatibility with call-sites
     window = _parse_trade_window(entry_ts=entry_ts, exit_ts=exit_ts)
-    raw_df = _build_raw_context(window)
+    raw_df, raw_keys = _build_raw_context(window)
     opp_df = _load_opportunities_for_window(window)
 
     status_parts: list[str] = []
@@ -334,6 +341,11 @@ def export_trade_context(
         mid = pd.to_numeric(merged["mid_price"], errors="coerce")
         ret = mid.pct_change()
         merged["volatility_context"] = ret.rolling(window=20, min_periods=5).std()
+    merged["bid"] = merged.get("best_bid")
+    merged["ask"] = merged.get("best_ask")
+    merged["aggressive_buyers"] = merged.get("aggressive_buy_count")
+    merged["aggressive_sellers"] = merged.get("aggressive_sell_count")
+    merged["volatility"] = merged.get("volatility_context")
     if not merged.empty:
         nearest_entry_idx = (merged["timestamp"] - window.entry_ts).abs().idxmin()
         merged.loc[nearest_entry_idx, "row_phase"] = "entry"
@@ -348,5 +360,29 @@ def export_trade_context(
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = out_dir / f"trade_context_{_sanitize_ts_for_filename(window.trade_ref)}.csv"
     merged.to_csv(output_path, index=False, encoding="utf-8")
+    required_micro_cols = [
+        "bid",
+        "ask",
+        "bid_size",
+        "ask_size",
+        "buy_volume",
+        "sell_volume",
+        "aggressive_buyers",
+        "aggressive_sellers",
+        "imbalance",
+        "queue_imbalance",
+        "microprice",
+        "spread",
+        "volatility",
+        "anomaly_score",
+        "anomaly_percentile",
+        "regime",
+        "action",
+    ]
+    missing_micro = [c for c in required_micro_cols if c not in merged.columns or merged[c].isna().all()]
+    if missing_micro:
+        status_parts.append(f"missing_or_empty_fields={missing_micro}")
+    if raw_keys:
+        status_parts.append(f"raw_event_keys={sorted(raw_keys)}")
     status_message = "ok" if not status_parts else "; ".join(status_parts)
     return merged, output_path, status_message
