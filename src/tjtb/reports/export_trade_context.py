@@ -92,6 +92,9 @@ def _load_opportunities_for_window(window: TradeWindow) -> pd.DataFrame:
             "timestamp",
             "anomaly_percentile",
             "anomaly_score",
+            "direction",
+            "regime",
+            "action",
             "imbalance",
             "top_of_book_imbalance",
         )
@@ -225,18 +228,23 @@ def _build_raw_context(window: TradeWindow) -> pd.DataFrame:
                     ask_sz = asks.get(best_ask, 0.0)
                     denom = bid_sz + ask_sz
                     imbalance = ((bid_sz - ask_sz) / denom) if denom > 0 else None
+                    microprice = ((best_ask * bid_sz) + (best_bid * ask_sz)) / denom if denom > 0 else None
                     rows.append(
                         {
                             "timestamp": ts,
                             "best_bid": best_bid,
                             "best_ask": best_ask,
+                            "bid_size": bid_sz,
+                            "ask_size": ask_sz,
                             "mid_price": mid,
+                            "microprice": microprice,
                             "spread": spread,
                             "buy_volume": buy_volume,
                             "aggressive_buy_count": buy_count,
                             "sell_volume": sell_volume,
                             "aggressive_sell_count": sell_count,
                             "imbalance": imbalance,
+                            "queue_imbalance": imbalance,
                         }
                     )
 
@@ -262,15 +270,23 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
         "timestamp",
         "best_bid",
         "best_ask",
+        "bid_size",
+        "ask_size",
         "mid_price",
+        "microprice",
         "spread",
         "buy_volume",
         "aggressive_buy_count",
         "sell_volume",
         "aggressive_sell_count",
         "imbalance",
+        "queue_imbalance",
+        "volatility_context",
         "anomaly_score",
         "anomaly_percentile",
+        "direction",
+        "regime",
+        "action",
         "trade_ref",
         "row_phase",
     ]
@@ -314,6 +330,10 @@ def export_trade_context(
     merged = merged.dropna(subset=["timestamp"]).sort_values("timestamp")
     merged["trade_ref"] = window.trade_ref
     merged["row_phase"] = merged["timestamp"].apply(lambda ts: _row_phase(ts, window))
+    if "mid_price" in merged.columns:
+        mid = pd.to_numeric(merged["mid_price"], errors="coerce")
+        ret = mid.pct_change()
+        merged["volatility_context"] = ret.rolling(window=20, min_periods=5).std()
     if not merged.empty:
         nearest_entry_idx = (merged["timestamp"] - window.entry_ts).abs().idxmin()
         merged.loc[nearest_entry_idx, "row_phase"] = "entry"

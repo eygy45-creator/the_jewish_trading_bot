@@ -400,52 +400,123 @@ def main() -> None:
         if tb:
             st.code(str(tb), language="text")
 
-    if trade_rows is not None and trade_rows == 0:
-        st.warning("No paper trade rows yet (file may be header-only or empty). Strategy may be waiting for signals or feed.")
-    if opp_rows is not None and opp_rows == 0:
-        st.warning("No opportunity rows yet — no bearish 99pct signals logged to CSV, or bot not processing feed.")
-
     quarantined_opp, quarantined_reason = _quarantine_invalid_opportunities_csv(OPPORTUNITIES_PATH)
 
     raw_trades_csv, trades_csv_err = _read_csv_safe(PAPER_TRADES_PATH)
     raw_opps_csv, opps_csv_err = _read_csv_safe(OPPORTUNITIES_PATH)
     trades_missing_cols = _missing_required_columns(raw_trades_csv, EXPECTED_TRADE_COLS) if not raw_trades_csv.empty else []
 
-    with st.expander("Debug: CSV diagnostics", expanded=False):
-        st.markdown("**paper_trades.csv**")
-        st.write(f"path: `{PAPER_TRADES_PATH}`")
-        st.write(f"exists: `{PAPER_TRADES_PATH.is_file()}`")
-        st.write(f"row_count(excl header): `{_csv_data_row_count(PAPER_TRADES_PATH)}`")
-        st.write(f"last_modified: `{_file_mtime_iso(PAPER_TRADES_PATH)}`")
-        st.write(f"columns: `{list(raw_trades_csv.columns) if not raw_trades_csv.empty else []}`")
-        if not raw_trades_csv.empty:
-            st.write("first 3 rows")
-            st.dataframe(raw_trades_csv.head(3), use_container_width=True, hide_index=True)
-            st.write("last 3 rows")
-            st.dataframe(raw_trades_csv.tail(3), use_container_width=True, hide_index=True)
-        else:
-            st.caption(f"paper_trades.csv read status: {trades_csv_err or 'ok'}")
-
-        st.markdown("**opportunities.csv**")
-        st.write(f"path: `{OPPORTUNITIES_PATH}`")
-        st.write(f"exists: `{OPPORTUNITIES_PATH.is_file()}`")
-        st.write(f"row_count(excl header): `{_csv_data_row_count(OPPORTUNITIES_PATH)}`")
-        st.write(f"last_modified: `{_file_mtime_iso(OPPORTUNITIES_PATH)}`")
-        st.write(f"columns: `{list(raw_opps_csv.columns) if not raw_opps_csv.empty else []}`")
-        if not raw_opps_csv.empty:
-            st.write("first 3 rows")
-            st.dataframe(raw_opps_csv.head(3), use_container_width=True, hide_index=True)
-            st.write("last 3 rows")
-            st.dataframe(raw_opps_csv.tail(3), use_container_width=True, hide_index=True)
-        else:
-            st.caption(f"opportunities.csv read status: {opps_csv_err or 'ok'}")
-
     df = load_paper_trades(PAPER_TRADES_PATH)
     opps, opps_fallback_applied = load_opportunities(OPPORTUNITIES_PATH)
     opps_missing_cols = _missing_required_columns(opps, EXPECTED_OPP_COLS) if not opps.empty else []
     valid_trades = df[df.get("_valid_trade", pd.Series(False, index=df.index)).fillna(False)].copy() if not df.empty else df
+    chron = valid_trades.sort_values("_exit_ts", na_position="last", ascending=True) if not valid_trades.empty else valid_trades
+    r = chron["r_value"] if not chron.empty else pd.Series(dtype=float)
+    cum_r = r.cumsum() if not r.empty else pd.Series(dtype=float)
+    wins = (r > 0).sum() if not r.empty else 0
+    n = int(len(chron))
 
-    st.subheader("Opportunities table (newest at bottom of tail)")
+    st.subheader("Summary")
+    if trades_csv_err is not None or trades_missing_cols:
+        st.warning(
+            f"Analytics input issue: row_count={len(df)} detected_columns={list(df.columns)} missing_columns={trades_missing_cols}"
+        )
+    total_r = float(r.sum()) if not r.empty else 0.0
+    win_rate = float(wins / n) if n else 0.0
+    avg_r = float(r.mean()) if n else 0.0
+    best_r = float(r.max()) if n else 0.0
+    worst_r = float(r.min()) if n else 0.0
+    mdd_r = max_drawdown_r(cum_r.reset_index(drop=True)) if not cum_r.empty else 0.0
+    lose_streak = max_losing_streak_r(chron["r_value"].reset_index(drop=True)) if n else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c5, c6, c7, c8 = st.columns(4)
+    c1.metric("Total trades", f"{n:,}")
+    c2.metric("Realized PnL (R)", f"{total_r:,.3f}")
+    c3.metric("Win rate", f"{win_rate:.1%}")
+    c4.metric("Average R", f"{avg_r:,.3f}")
+    c5.metric("Best trade (R)", f"{best_r:,.3f}")
+    c6.metric("Worst trade (R)", f"{worst_r:,.3f}")
+    c7.metric("Max drawdown (R)", f"{mdd_r:,.3f}")
+    c8.metric("Max losing streak", f"{lose_streak:,}")
+
+    st.subheader("Equity / EV Curve")
+    if n < 1:
+        st.warning(
+            f"Could not render curves: row_count={n} detected_columns={list(chron.columns)} missing_columns={_missing_required_columns(chron, ['r_value'])}"
+        )
+    else:
+        curve_l, curve_r = st.columns(2)
+        with curve_l:
+            if n < 2:
+                st.info("not enough trades for EV chart")
+            else:
+                ev_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "ev_R": r.expanding(min_periods=1).mean().values})
+                st.line_chart(ev_df, x="trade #", y="ev_R")
+        with curve_r:
+            equity_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "equity_R": cum_r.values})
+            st.line_chart(equity_df, x="trade #", y="equity_R")
+
+    st.subheader("Breakdown by outcome/regime")
+    if n < 1:
+        st.warning(
+            f"Could not render breakdown: row_count={n} detected_columns={list(df.columns)} missing_columns={_missing_required_columns(df, ['outcome','regime','r_value'])}"
+        )
+    else:
+        b1, b2 = st.columns(2)
+        with b1:
+            oc = df.groupby("outcome", dropna=False)["r_value"].agg(trades="count", total_R="sum", avg_R="mean").sort_values("trades", ascending=False)
+            st.dataframe(oc, use_container_width=True)
+        with b2:
+            rg = df.groupby("regime", dropna=False)["r_value"].agg(trades="count", total_R="sum", avg_R="mean").sort_values("trades", ascending=False)
+            st.dataframe(rg, use_container_width=True)
+
+    st.subheader("Detailed Trade Analysis")
+    context_df = pd.DataFrame()
+    context_path: Path | None = None
+    selected_entry_ts = ""
+    selected_exit_ts = ""
+    if df.empty:
+        st.info("No trades available for detailed analysis.")
+    else:
+        trade_selector_df = df.sort_values("_entry_ts", ascending=False, na_position="last").reset_index(drop=True)
+        trade_selector_df["_trade_label"] = trade_selector_df.apply(
+            lambda r: f"entry={r.get('entry_ts', 'n/a')} | exit={r.get('exit_ts', 'n/a')} | side={r.get('side', 'n/a')} | outcome={r.get('outcome', 'n/a')} | R={r.get('r_value', 'n/a')}",
+            axis=1,
+        )
+        selected_label = st.selectbox("Select a paper trade", options=trade_selector_df["_trade_label"].tolist(), index=0, key="tjtb_trade_context_selector")
+        selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
+        selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
+        selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
+        st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
+
+    st.subheader("Trade Context Export")
+    st.caption("Full microstructure context: bid/ask, sizes, aggressive flow, imbalance, queue imbalance, microprice, spread, volatility, anomaly/regime/action.")
+    if not _HAS_TRADE_CONTEXT_EXPORTER or export_trade_context is None:
+        st.info("Trade context exporter module is unavailable on this environment.")
+    elif not selected_entry_ts:
+        st.warning("Selected trade has no valid entry timestamp.")
+    else:
+        try:
+            export_result = export_trade_context(entry_ts=selected_entry_ts, exit_ts=selected_exit_ts if selected_exit_ts else None)
+            if isinstance(export_result, tuple) and len(export_result) >= 3:
+                context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
+            else:
+                context_df, context_path = export_result
+                context_msg = None
+            if context_msg:
+                st.info(str(context_msg))
+            st.dataframe(context_df.head(300), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download selected trade full context CSV",
+                data=context_df.to_csv(index=False).encode("utf-8"),
+                file_name=context_path.name if context_path is not None else "trade_context.csv",
+                mime="text/csv",
+                key=f"tjtb_download_trade_context_{selected_entry_ts}",
+            )
+        except (ValueError, OSError) as exc:
+            st.error(f"Could not export trade context: {exc}")
+
+    st.subheader("Opportunities table")
     if opps_fallback_applied:
         st.info("fallback reader applied successfully")
     if quarantined_opp:
@@ -459,156 +530,58 @@ def main() -> None:
         st.info(f"Missing required columns: {opps_missing_cols}")
     elif (not opps_fallback_applied) and (opps.empty or _opportunities_invalid(opps)):
         st.warning("opportunities.csv schema/data invalid")
-        if opps.empty:
-            st.info("No opportunity rows in memory (empty file or parse issue).")
-        else:
-            st.info("Rows exist but do not contain valid ts/anomaly signal values.")
-        st.dataframe(opps, use_container_width=True, hide_index=True)
-    elif opps.empty:
-        st.info("No opportunity rows in memory (empty file or parse issue).")
-    else:
-        st.dataframe(opps, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download opportunities.csv",
+        data=(opps.to_csv(index=False).encode("utf-8") if not opps.empty else b""),
+        file_name="opportunities.csv",
+        mime="text/csv",
+        key="tjtb_download_opportunities_csv",
+    )
+    st.dataframe(opps, use_container_width=True, hide_index=True)
 
-    st.subheader("Paper trades table (newest first)")
+    st.subheader("Paper trades table")
     if trades_csv_err is not None:
         st.warning("paper_trades.csv schema/data invalid")
         st.info(f"paper_trades.csv read status: {trades_csv_err}")
     elif trades_missing_cols:
         st.warning("paper_trades.csv schema/data invalid")
         st.info(f"Missing required columns: {trades_missing_cols}")
-    if df.empty:
-        st.info("No closed trades loaded (file empty, missing, or schema-invalid).")
-    else:
-        display_cols = [
-            "exit_ts",
-            "entry_ts",
-            "side",
-            "entry_price",
-            "exit_price",
-            "outcome",
-            "r_value",
-            "regime",
-        ]
-        table = df.sort_values("_exit_ts", ascending=False, na_position="last")[display_cols].copy()
-        st.dataframe(table, use_container_width=True, hide_index=True)
+    display_cols = ["exit_ts", "entry_ts", "side", "entry_price", "exit_price", "outcome", "r_value", "regime"]
+    table = df.sort_values("_exit_ts", ascending=False, na_position="last")[display_cols].copy() if not df.empty else pd.DataFrame(columns=display_cols)
+    st.download_button(
+        "Download paper_trades.csv",
+        data=(table.to_csv(index=False).encode("utf-8") if not table.empty else b""),
+        file_name="paper_trades.csv",
+        mime="text/csv",
+        key="tjtb_download_paper_trades_csv",
+    )
+    st.dataframe(table, use_container_width=True, hide_index=True)
 
-        st.subheader("Trade Context Export")
-        trade_selector_df = df.sort_values("_entry_ts", ascending=False, na_position="last").reset_index(drop=True)
-        trade_selector_df["_trade_label"] = trade_selector_df.apply(
-            lambda r: (
-                f"entry={r.get('entry_ts', 'n/a')} | exit={r.get('exit_ts', 'n/a')} | "
-                f"side={r.get('side', 'n/a')} | outcome={r.get('outcome', 'n/a')} | R={r.get('r_value', 'n/a')}"
-            ),
-            axis=1,
-        )
-        selected_label = st.selectbox(
-            "Select a paper trade",
-            options=trade_selector_df["_trade_label"].tolist(),
-            index=0,
-            key="tjtb_trade_context_selector",
-        )
-        selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
-        selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
-        selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
-
-        if not _HAS_TRADE_CONTEXT_EXPORTER or export_trade_context is None:
-            st.info("Trade context exporter module is unavailable on this environment.")
-        elif not selected_entry_ts:
-            st.warning("Selected trade has no valid entry timestamp.")
-        else:
-            try:
-                export_result = export_trade_context(
-                    entry_ts=selected_entry_ts,
-                    exit_ts=selected_exit_ts if selected_exit_ts else None,
-                )
-                if isinstance(export_result, tuple) and len(export_result) >= 3:
-                    context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
-                else:
-                    context_df, context_path = export_result
-                    context_msg = None
-                st.caption(f"Export path: `{context_path.resolve()}` · rows: **{len(context_df)}**")
-                if context_msg:
-                    st.info(str(context_msg))
-                st.download_button(
-                    "Download trade context CSV",
-                    data=context_df.to_csv(index=False).encode("utf-8"),
-                    file_name=context_path.name,
-                    mime="text/csv",
-                    key=f"tjtb_download_trade_context_{selected_entry_ts}",
-                )
-            except (ValueError, OSError) as exc:
-                st.error(f"Could not export trade context: {exc}")
-
-        chron = valid_trades.sort_values("_exit_ts", na_position="last", ascending=True) if not valid_trades.empty else valid_trades
-        r = chron["r_value"]
-        cum_r = r.cumsum()
-        wins = (r > 0).sum() if not r.empty else 0
-        n = int(len(chron))
-        total_r = float(r.sum())
-        win_rate = float(wins / n) if n else 0.0
-        avg_r = float(r.mean()) if n else 0.0
-        best_r = float(r.max()) if n else 0.0
-        worst_r = float(r.min()) if n else 0.0
-        mdd_r = max_drawdown_r(cum_r.reset_index(drop=True))
-        lose_streak = max_losing_streak_r(chron["r_value"].reset_index(drop=True))
-
-        st.subheader("Summary")
-        c1, c2, c3, c4 = st.columns(4)
-        c5, c6, c7, c8 = st.columns(4)
-        c1.metric("Total trades", f"{n:,}")
-        c2.metric("Realized PnL (R)", f"{total_r:,.3f}")
-        c3.metric("Win rate", f"{win_rate:.1%}")
-        c4.metric("Average R", f"{avg_r:,.3f}")
-        c5.metric("Best trade (R)", f"{best_r:,.3f}")
-        c6.metric("Worst trade (R)", f"{worst_r:,.3f}")
-        c7.metric("Max drawdown (R)", f"{mdd_r:,.3f}")
-        c8.metric("Max losing streak", f"{lose_streak:,}")
-
-        st.subheader("EV (R expectancy)")
-        if n < 2:
-            st.info("not enough trades for EV chart")
-        else:
-            ev_df = pd.DataFrame(
-                {
-                    "trade #": range(1, len(chron) + 1),
-                    "ev_R": r.expanding(min_periods=1).mean().values,
-                }
-            )
-            st.line_chart(ev_df, x="trade #", y="ev_R")
-
-        st.subheader("Cumulative equity (R)")
-        if n < 1:
-            st.info("Not enough valid trades for equity chart.")
-        else:
-            equity_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "equity_R": cum_r.values})
-            st.line_chart(equity_df, x="trade #", y="equity_R")
-
-        st.subheader("Breakdown")
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            st.markdown("**By outcome**")
-            oc = (
-                df.groupby("outcome", dropna=False)["r_value"]
-                .agg(trades="count", total_R="sum", avg_R="mean")
-                .sort_values("trades", ascending=False)
-            )
-            st.dataframe(oc, use_container_width=True)
-        with b2:
-            st.markdown("**By regime**")
-            rg = (
-                df.groupby("regime", dropna=False)["r_value"]
-                .agg(trades="count", total_R="sum", avg_R="mean")
-                .sort_values("trades", ascending=False)
-            )
-            st.dataframe(rg, use_container_width=True)
-        with b3:
-            st.markdown("**By side**")
-            sd = (
-                df.groupby("side", dropna=False)["r_value"]
-                .agg(trades="count", total_R="sum", avg_R="mean")
-                .sort_values("trades", ascending=False)
-            )
-            st.dataframe(sd, use_container_width=True)
+    with st.expander("Debug diagnostics", expanded=False):
+        st.markdown("**Trade context import diagnostics**")
+        st.write(f"module: `{_TRADE_CONTEXT_IMPORT_DIAG.get('module')}`")
+        st.write(f"loaded_from: `{_TRADE_CONTEXT_IMPORT_DIAG.get('module_file') or 'n/a'}`")
+        st.write(f"importer_status: `{_TRADE_CONTEXT_IMPORT_DIAG.get('ok')}`")
+        if not _HAS_TRADE_CONTEXT_EXPORTER:
+            st.code(str(_TRADE_CONTEXT_IMPORT_DIAG.get("traceback") or _TRADE_CONTEXT_IMPORT_DIAG.get("exception")), language="text")
+        st.markdown("**paper_trades.csv**")
+        st.write(f"path: `{PAPER_TRADES_PATH}`")
+        st.write(f"exists: `{PAPER_TRADES_PATH.is_file()}`")
+        st.write(f"row_count(excl header): `{_csv_data_row_count(PAPER_TRADES_PATH)}`")
+        st.write(f"last_modified: `{_file_mtime_iso(PAPER_TRADES_PATH)}`")
+        st.write(f"columns: `{list(raw_trades_csv.columns) if not raw_trades_csv.empty else []}`")
+        if not raw_trades_csv.empty:
+            st.dataframe(raw_trades_csv.head(3), use_container_width=True, hide_index=True)
+            st.dataframe(raw_trades_csv.tail(3), use_container_width=True, hide_index=True)
+        st.markdown("**opportunities.csv**")
+        st.write(f"path: `{OPPORTUNITIES_PATH}`")
+        st.write(f"exists: `{OPPORTUNITIES_PATH.is_file()}`")
+        st.write(f"row_count(excl header): `{_csv_data_row_count(OPPORTUNITIES_PATH)}`")
+        st.write(f"last_modified: `{_file_mtime_iso(OPPORTUNITIES_PATH)}`")
+        st.write(f"columns: `{list(raw_opps_csv.columns) if not raw_opps_csv.empty else []}`")
+        if not raw_opps_csv.empty:
+            st.dataframe(raw_opps_csv.head(3), use_container_width=True, hide_index=True)
+            st.dataframe(raw_opps_csv.tail(3), use_container_width=True, hide_index=True)
 
     refreshed_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     st.session_state["tjtb_last_refreshed_at"] = refreshed_at
