@@ -39,11 +39,13 @@ def _load_trade_context_exporter() -> tuple[object | None, dict[str, str | bool 
     try:
         mod = import_module("tjtb.reports.export_trade_context")
         fn = getattr(mod, "export_trade_context", None)
+        sample_keys_fn = getattr(mod, "sample_raw_event_keys", None)
         if fn is None:
             diag["exception"] = "export_trade_context symbol not found in module"
             return None, diag
         diag["ok"] = True
         diag["module_file"] = str(getattr(mod, "__file__", "") or "")
+        diag["sample_keys_fn"] = sample_keys_fn
         return fn, diag
     except Exception as exc:
         diag["exception"] = f"{exc.__class__.__name__}: {exc}"
@@ -509,7 +511,7 @@ def main() -> None:
             if context_msg:
                 st.info(str(context_msg))
             required_preview_cols = [
-                "timestamp", "bid", "ask", "bid_size", "ask_size", "buy_volume", "sell_volume",
+                "ts", "bid", "ask", "bid_size", "ask_size", "price", "size", "side", "buy_volume", "sell_volume",
                 "aggressive_buyers", "aggressive_sellers", "imbalance", "queue_imbalance", "microprice",
                 "spread", "volatility", "anomaly_score", "anomaly_percentile", "direction", "regime", "action", "row_phase",
             ]
@@ -589,6 +591,16 @@ def main() -> None:
         if not raw_trades_csv.empty:
             st.dataframe(raw_trades_csv.head(3), use_container_width=True, hide_index=True)
             st.dataframe(raw_trades_csv.tail(3), use_container_width=True, hide_index=True)
+        st.markdown("**raw NDJSON key sample**")
+        sample_keys_fn = _TRADE_CONTEXT_IMPORT_DIAG.get("sample_keys_fn")
+        if callable(sample_keys_fn):
+            try:
+                keys = sample_keys_fn()
+                st.write(f"sample raw keys: `{keys}`")
+            except Exception as exc:  # noqa: BLE001
+                st.write(f"sample raw keys error: `{exc}`")
+        else:
+            st.write("sample raw keys unavailable")
         st.markdown("**opportunities.csv**")
         st.write(f"path: `{OPPORTUNITIES_PATH}`")
         st.write(f"exists: `{OPPORTUNITIES_PATH.is_file()}`")

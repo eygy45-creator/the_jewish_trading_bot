@@ -12,6 +12,26 @@ import pandas as pd
 from tjtb.runtime_paths import LIVE_DATA_DIR, OPPORTUNITIES_PATH, PAPER_TRADES_PATH, RAW_DATA_DIR
 
 RAW_NDJSON_GLOB = "coinbase_*.ndjson"
+REQUIRED_EXPORT_COLUMNS = [
+    "ts",
+    "bid",
+    "ask",
+    "bid_size",
+    "ask_size",
+    "price",
+    "size",
+    "side",
+    "buy_volume",
+    "sell_volume",
+    "imbalance",
+    "microprice",
+    "spread",
+    "anomaly_score",
+    "anomaly_percentile",
+    "regime",
+    "action",
+    "raw_json",
+]
 
 
 @dataclass(frozen=True)
@@ -60,7 +80,52 @@ def sample_raw_event_keys(max_files: int = 1, max_objects_per_file: int = 200) -
             n += 1
             if n >= max_objects_per_file:
                 break
-    return sorted(keys)
+    sampled = sorted(keys)
+    # Include nested keys from latest file so dashboard debug shows actionable schema details.
+    nested = _sample_latest_raw_keysets(max_objects=max_objects_per_file)
+    for group_name in ("event_keys", "trade_keys", "update_keys"):
+        for key in nested.get(group_name, []):
+            sampled.append(f"{group_name}.{key}")
+    return sorted(set(sampled))
+
+
+def _sample_latest_raw_keysets(max_objects: int = 500) -> dict[str, list[str]]:
+    files = sorted([p for p in RAW_DATA_DIR.glob(RAW_NDJSON_GLOB) if p.is_file()], key=lambda x: x.stat().st_mtime)
+    if not files:
+        return {"top_keys": [], "event_keys": [], "trade_keys": [], "update_keys": []}
+    latest = files[-1]
+    top_keys: set[str] = set()
+    event_keys: set[str] = set()
+    trade_keys: set[str] = set()
+    update_keys: set[str] = set()
+    n = 0
+    for obj in _iter_json_objects(latest):
+        top_keys.update(obj.keys())
+        events = obj.get("events")
+        if isinstance(events, list):
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                event_keys.update(ev.keys())
+                trades = ev.get("trades")
+                if isinstance(trades, list):
+                    for tr in trades:
+                        if isinstance(tr, dict):
+                            trade_keys.update(tr.keys())
+                updates = ev.get("updates")
+                if isinstance(updates, list):
+                    for up in updates:
+                        if isinstance(up, dict):
+                            update_keys.update(up.keys())
+        n += 1
+        if n >= max_objects:
+            break
+    return {
+        "top_keys": sorted(top_keys),
+        "event_keys": sorted(event_keys),
+        "trade_keys": sorted(trade_keys),
+        "update_keys": sorted(update_keys),
+    }
 
 
 def _first_present(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
@@ -344,32 +409,14 @@ def _row_phase(ts: pd.Timestamp, window: TradeWindow) -> str:
 
 
 def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
-    wanted = [
-        "ts",
-        "bid",
-        "ask",
-        "bid_size",
-        "ask_size",
-        "price",
-        "size",
-        "side",
-        "microprice",
-        "spread",
-        "buy_volume",
+    wanted = REQUIRED_EXPORT_COLUMNS + [
         "aggressive_buyers",
-        "sell_volume",
         "aggressive_sellers",
-        "imbalance",
         "queue_imbalance",
         "volatility",
-        "anomaly_score",
-        "anomaly_percentile",
         "direction",
-        "regime",
-        "action",
         "trade_ref",
         "row_phase",
-        "raw_json",
     ]
     out = df.copy()
     for c in wanted:
@@ -390,6 +437,7 @@ def export_trade_context(
     _ = paper_trades_path  # explicit dependency for compatibility with call-sites
     window = _parse_trade_window(entry_ts=entry_ts, exit_ts=exit_ts)
     raw_df, raw_keys = _build_raw_context(window)
+    raw_keysets = _sample_latest_raw_keysets()
     opp_df = _load_opportunities_for_window(window)
 
     status_parts: list[str] = []
@@ -418,7 +466,7 @@ def export_trade_context(
     merged["trade_ref"] = window.trade_ref
     merged["row_phase"] = merged["ts"].apply(lambda ts: _row_phase(ts, window))
     price_for_vol = pd.to_numeric(merged.get("microprice"), errors="coerce")
-    ret = price_for_vol.pct_change()
+    ret = price_for_vol.pct_change(fill_method=None)
     merged["volatility"] = ret.rolling(window=20, min_periods=5).std()
     if not merged.empty:
         nearest_entry_idx = (merged["ts"] - window.entry_ts).abs().idxmin()
@@ -427,6 +475,12 @@ def export_trade_context(
         merged.loc[nearest_exit_idx, "row_phase"] = "exit"
 
     merged = _ensure_required_columns(merged)
+    bidask_missing_in_raw = ("bid" not in raw_keys) and ("ask" not in raw_keys)
+    if bidask_missing_in_raw:
+        # Coinbase market feed typically exposes L2 as updates(price_level/new_quantity/side),
+        # not direct bid/ask keys. Keep export schema stable with empty bid/ask columns.
+        for c in ("bid", "ask", "bid_size", "ask_size"):
+            merged[c] = pd.NA
     merged["ts"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     merged = merged.replace({pd.NA: None})
 
@@ -434,34 +488,16 @@ def export_trade_context(
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = out_dir / f"trade_context_{_sanitize_ts_for_filename(window.trade_ref)}.csv"
     merged.to_csv(output_path, index=False, encoding="utf-8")
-    required_micro_cols = [
-        "ts",
-        "bid",
-        "ask",
-        "bid_size",
-        "ask_size",
-        "price",
-        "size",
-        "side",
-        "buy_volume",
-        "sell_volume",
-        "aggressive_buyers",
-        "aggressive_sellers",
-        "imbalance",
-        "queue_imbalance",
-        "microprice",
-        "spread",
-        "volatility",
-        "anomaly_score",
-        "anomaly_percentile",
-        "regime",
-        "action",
-        "raw_json",
-    ]
+    required_micro_cols = REQUIRED_EXPORT_COLUMNS
     missing_micro = [c for c in required_micro_cols if c not in merged.columns or merged[c].isna().all()]
     if missing_micro:
         status_parts.append(f"missing_or_empty_fields={missing_micro}")
     if raw_keys:
         status_parts.append(f"raw_event_keys={sorted(raw_keys)}")
+    if bidask_missing_in_raw:
+        status_parts.append(
+            "raw_keys_warning=bid/ask keys missing in Coinbase NDJSON;"
+            f" latest_keysets={raw_keysets}"
+        )
     status_message = "ok" if not status_parts else "; ".join(status_parts)
     return merged, output_path, status_message
