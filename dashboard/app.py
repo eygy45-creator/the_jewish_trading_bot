@@ -475,28 +475,31 @@ def main() -> None:
     context_path: Path | None = None
     selected_entry_ts = ""
     selected_exit_ts = ""
-    if df.empty:
-        st.info("No trades available for detailed analysis.")
-    else:
-        trade_selector_df = df.sort_values("_entry_ts", ascending=False, na_position="last").reset_index(drop=True)
-        trade_selector_df["_trade_label"] = trade_selector_df.apply(
-            lambda r: f"entry={r.get('entry_ts', 'n/a')} | exit={r.get('exit_ts', 'n/a')} | side={r.get('side', 'n/a')} | outcome={r.get('outcome', 'n/a')} | R={r.get('r_value', 'n/a')}",
-            axis=1,
-        )
-        selected_label = st.selectbox("Select a paper trade", options=trade_selector_df["_trade_label"].tolist(), index=0, key="tjtb_trade_context_selector")
-        selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
-        selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
-        selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
-        st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
+    try:
+        if df.empty:
+            st.info("No trades available for detailed analysis.")
+        else:
+            trade_selector_df = df.sort_values("_entry_ts", ascending=False, na_position="last").reset_index(drop=True)
+            trade_selector_df["_trade_label"] = trade_selector_df.apply(
+                lambda r: f"entry={r.get('entry_ts', 'n/a')} | exit={r.get('exit_ts', 'n/a')} | side={r.get('side', 'n/a')} | outcome={r.get('outcome', 'n/a')} | R={r.get('r_value', 'n/a')}",
+                axis=1,
+            )
+            selected_label = st.selectbox("Select a paper trade", options=trade_selector_df["_trade_label"].tolist(), index=0, key="tjtb_trade_context_selector")
+            selected_trade = trade_selector_df.loc[trade_selector_df["_trade_label"] == selected_label].iloc[0]
+            selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
+            selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
+            st.dataframe(selected_trade.to_frame().T, use_container_width=True, hide_index=True)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Detailed Trade Analysis error: {exc}")
 
     st.subheader("Trade Context Export")
     st.caption("Full microstructure context: bid/ask, sizes, aggressive flow, imbalance, queue imbalance, microprice, spread, volatility, anomaly/regime/action.")
-    if not _HAS_TRADE_CONTEXT_EXPORTER or export_trade_context is None:
-        st.info("Trade context exporter module is unavailable on this environment.")
-    elif not selected_entry_ts:
-        st.warning("Selected trade has no valid entry timestamp.")
-    else:
-        try:
+    try:
+        if not _HAS_TRADE_CONTEXT_EXPORTER or export_trade_context is None:
+            st.info("Trade context exporter module is unavailable on this environment.")
+        elif not selected_entry_ts:
+            st.warning("Selected trade has no valid entry timestamp.")
+        else:
             export_result = export_trade_context(entry_ts=selected_entry_ts, exit_ts=selected_exit_ts if selected_exit_ts else None)
             if isinstance(export_result, tuple) and len(export_result) >= 3:
                 context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
@@ -506,25 +509,9 @@ def main() -> None:
             if context_msg:
                 st.info(str(context_msg))
             required_preview_cols = [
-                "timestamp",
-                "bid",
-                "ask",
-                "bid_size",
-                "ask_size",
-                "buy_volume",
-                "sell_volume",
-                "aggressive_buyers",
-                "aggressive_sellers",
-                "imbalance",
-                "queue_imbalance",
-                "microprice",
-                "spread",
-                "volatility",
-                "anomaly_score",
-                "anomaly_percentile",
-                "regime",
-                "action",
-                "row_phase",
+                "timestamp", "bid", "ask", "bid_size", "ask_size", "buy_volume", "sell_volume",
+                "aggressive_buyers", "aggressive_sellers", "imbalance", "queue_imbalance", "microprice",
+                "spread", "volatility", "anomaly_score", "anomaly_percentile", "direction", "regime", "action", "row_phase",
             ]
             missing_preview = [c for c in required_preview_cols if c not in context_df.columns]
             if missing_preview:
@@ -541,8 +528,8 @@ def main() -> None:
                 mime="text/csv",
                 key=f"tjtb_download_trade_context_{selected_entry_ts}",
             )
-        except (ValueError, OSError) as exc:
-            st.error(f"Could not export trade context: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Trade Context Export error: {exc}")
 
     st.subheader("Opportunities table")
     if opps_fallback_applied:

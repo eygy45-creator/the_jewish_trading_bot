@@ -39,6 +39,15 @@ def _safe_ts(x: Any) -> pd.Timestamp | None:
     return ts
 
 
+def _pick_ts(obj: dict[str, Any]) -> pd.Timestamp | None:
+    for k in ("event_time", "time", "ts", "timestamp"):
+        if k in obj:
+            ts = _safe_ts(obj.get(k))
+            if ts is not None:
+                return ts
+    return None
+
+
 def _first_present(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     for col in candidates:
         if col in df.columns:
@@ -118,7 +127,7 @@ def _candidate_raw_files(window: TradeWindow) -> list[Path]:
             selected.append(p)
     if selected:
         return sorted(selected, key=lambda x: x.stat().st_mtime)
-    return sorted(files, key=lambda x: x.stat().st_mtime)[-2:]
+    return sorted(files, key=lambda x: x.stat().st_mtime)
 
 
 def _iter_json_objects(path: Path):
@@ -164,14 +173,18 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
                 for ev in events:
                     if not isinstance(ev, dict):
                         continue
+                    raw_keys.update(ev.keys())
                     trades = ev.get("trades")
                     if not isinstance(trades, list):
                         continue
                     for tr in trades:
                         if not isinstance(tr, dict):
                             continue
+                        raw_keys.update(tr.keys())
                         side = str(tr.get("side", "")).lower()
                         size = _safe_float(tr.get("size"))
+                        if size is None:
+                            size = _safe_float(tr.get("qty"))
                         if size is None:
                             continue
                         if side in {"buy", "bid"}:
@@ -193,20 +206,27 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
                     bids.clear()
                     asks.clear()
                 updates = ev.get("updates")
+                raw_keys.update(ev.keys())
                 if not isinstance(updates, list):
                     continue
                 for up in updates:
                     if not isinstance(up, dict):
                         continue
-                    ts_text = up.get("event_time")
-                    ts = _safe_ts(ts_text)
+                    raw_keys.update(up.keys())
+                    ts = _pick_ts(up)
                     if ts is None:
                         continue
                     side = str(up.get("side", "")).lower()
                     if side == "offer":
                         side = "ask"
                     px = _safe_float(up.get("price_level"))
+                    if px is None:
+                        px = _safe_float(up.get("price"))
                     qty = _safe_float(up.get("new_quantity"))
+                    if qty is None:
+                        qty = _safe_float(up.get("size"))
+                    if qty is None:
+                        qty = _safe_float(up.get("qty"))
                     if side not in {"bid", "ask"} or px is None or qty is None:
                         continue
 
