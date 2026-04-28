@@ -24,7 +24,13 @@ from tjtb.runtime_paths import (  # noqa: E402
     PROJECT_ROOT,
     RAW_DATA_DIR,
 )
-from tjtb.reports.export_trade_context import export_trade_context  # noqa: E402
+try:
+    from tjtb.reports.export_trade_context import export_trade_context  # noqa: E402
+
+    _HAS_TRADE_CONTEXT_EXPORTER = True
+except Exception:
+    export_trade_context = None
+    _HAS_TRADE_CONTEXT_EXPORTER = False
 
 RAW_NDJSON_GLOB = "coinbase_*.ndjson"
 HEARTBEAT_STALE_SEC = float(os.environ.get("TJTB_HEARTBEAT_STALE_SEC", "90"))
@@ -329,15 +335,24 @@ def main() -> None:
         selected_entry_ts = str(selected_trade.get("entry_ts", "") or "")
         selected_exit_ts = str(selected_trade.get("exit_ts", "") or "")
 
-        if not selected_entry_ts:
+        if not _HAS_TRADE_CONTEXT_EXPORTER or export_trade_context is None:
+            st.info("Trade context exporter module is unavailable on this environment.")
+        elif not selected_entry_ts:
             st.warning("Selected trade has no valid entry timestamp.")
         else:
             try:
-                context_df, context_path = export_trade_context(
+                export_result = export_trade_context(
                     entry_ts=selected_entry_ts,
                     exit_ts=selected_exit_ts if selected_exit_ts else None,
                 )
+                if isinstance(export_result, tuple) and len(export_result) >= 3:
+                    context_df, context_path, context_msg = export_result[0], export_result[1], export_result[2]
+                else:
+                    context_df, context_path = export_result
+                    context_msg = None
                 st.caption(f"Export path: `{context_path.resolve()}` · rows: **{len(context_df)}**")
+                if context_msg:
+                    st.info(str(context_msg))
                 st.download_button(
                     "Download trade context CSV",
                     data=context_df.to_csv(index=False).encode("utf-8"),
@@ -345,7 +360,7 @@ def main() -> None:
                     mime="text/csv",
                     key=f"tjtb_download_trade_context_{selected_entry_ts}",
                 )
-            except ValueError as exc:
+            except (ValueError, OSError) as exc:
                 st.error(f"Could not export trade context: {exc}")
 
         chron = df.sort_values("_exit_ts", na_position="last", ascending=True)
