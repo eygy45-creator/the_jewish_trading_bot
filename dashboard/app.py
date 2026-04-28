@@ -258,15 +258,16 @@ def load_paper_trades(path: Path) -> pd.DataFrame:
     return df
 
 
-def load_opportunities(path: Path) -> pd.DataFrame:
+def load_opportunities(path: Path) -> tuple[pd.DataFrame, bool]:
     if not path.is_file():
-        return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+        return pd.DataFrame(columns=EXPECTED_OPP_COLS), False
     try:
         df = pd.read_csv(path, encoding="utf-8")
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-        return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+        return pd.DataFrame(columns=EXPECTED_OPP_COLS), False
     if df.empty:
-        return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+        return pd.DataFrame(columns=EXPECTED_OPP_COLS), False
+    fallback_applied = False
     if any(c not in df.columns for c in EXPECTED_OPP_COLS):
         # Header fallback: if file has 7 columns but no valid header,
         # re-read treating all rows as data.
@@ -278,11 +279,13 @@ def load_opportunities(path: Path) -> pd.DataFrame:
                 names=EXPECTED_OPP_COLS,
             )
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-            return pd.DataFrame(columns=EXPECTED_OPP_COLS)
+            return pd.DataFrame(columns=EXPECTED_OPP_COLS), False
         if df_fallback.empty:
-            return pd.DataFrame(columns=EXPECTED_OPP_COLS)
-        return df_fallback[EXPECTED_OPP_COLS].copy()
-    return df[EXPECTED_OPP_COLS].copy()
+            return pd.DataFrame(columns=EXPECTED_OPP_COLS), False
+        df = df_fallback.copy()
+        fallback_applied = True
+    normalized = df[EXPECTED_OPP_COLS].copy()
+    return normalized, fallback_applied
 
 
 def max_losing_streak_r(r_series: pd.Series) -> int:
@@ -407,7 +410,6 @@ def main() -> None:
     raw_trades_csv, trades_csv_err = _read_csv_safe(PAPER_TRADES_PATH)
     raw_opps_csv, opps_csv_err = _read_csv_safe(OPPORTUNITIES_PATH)
     trades_missing_cols = _missing_required_columns(raw_trades_csv, EXPECTED_TRADE_COLS) if not raw_trades_csv.empty else []
-    opps_missing_cols = _missing_required_columns(raw_opps_csv, EXPECTED_OPP_COLS) if not raw_opps_csv.empty else []
 
     with st.expander("Debug: CSV diagnostics", expanded=False):
         st.markdown("**paper_trades.csv**")
@@ -439,22 +441,23 @@ def main() -> None:
             st.caption(f"opportunities.csv read status: {opps_csv_err or 'ok'}")
 
     df = load_paper_trades(PAPER_TRADES_PATH)
-    opps = load_opportunities(OPPORTUNITIES_PATH)
+    opps, opps_fallback_applied = load_opportunities(OPPORTUNITIES_PATH)
+    opps_missing_cols = _missing_required_columns(opps, EXPECTED_OPP_COLS) if not opps.empty else []
     valid_trades = df[df.get("_valid_trade", pd.Series(False, index=df.index)).fillna(False)].copy() if not df.empty else df
 
     st.subheader("Opportunities table (newest at bottom of tail)")
-    if quarantined_reason == "headerless_7col_fallback":
-        st.warning("opportunities.csv missing header; applying 7-column fallback reader")
+    if opps_fallback_applied:
+        st.info("fallback reader applied successfully")
     if quarantined_opp:
         st.warning("opportunities.csv schema/data invalid")
         st.info(f"Malformed opportunities.csv quarantined to `data/live/opportunities.bad.csv` ({quarantined_reason})")
     if opps_csv_err is not None:
         st.warning("opportunities.csv schema/data invalid")
         st.info(f"opportunities.csv read status: {opps_csv_err}")
-    elif opps_missing_cols:
+    elif (not opps_fallback_applied) and opps_missing_cols:
         st.warning("opportunities.csv schema/data invalid")
         st.info(f"Missing required columns: {opps_missing_cols}")
-    elif opps.empty or _opportunities_invalid(opps):
+    elif (not opps_fallback_applied) and (opps.empty or _opportunities_invalid(opps)):
         st.warning("opportunities.csv schema/data invalid")
         if opps.empty:
             st.info("No opportunity rows in memory (empty file or parse issue).")
