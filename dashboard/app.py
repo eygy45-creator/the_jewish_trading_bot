@@ -4,7 +4,9 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
 
 import pandas as pd
@@ -24,13 +26,31 @@ from tjtb.runtime_paths import (  # noqa: E402
     PROJECT_ROOT,
     RAW_DATA_DIR,
 )
-try:
-    from tjtb.reports.export_trade_context import export_trade_context  # noqa: E402
+def _load_trade_context_exporter() -> tuple[object | None, dict[str, str | bool | None]]:
+    diag: dict[str, str | bool | None] = {
+        "ok": False,
+        "module": "tjtb.reports.export_trade_context",
+        "module_file": None,
+        "exception": None,
+        "py_path": os.environ.get("PYTHONPATH"),
+    }
+    try:
+        mod = import_module("tjtb.reports.export_trade_context")
+        fn = getattr(mod, "export_trade_context", None)
+        if fn is None:
+            diag["exception"] = "export_trade_context symbol not found in module"
+            return None, diag
+        diag["ok"] = True
+        diag["module_file"] = str(getattr(mod, "__file__", "") or "")
+        return fn, diag
+    except Exception as exc:
+        diag["exception"] = f"{exc.__class__.__name__}: {exc}"
+        diag["traceback"] = traceback.format_exc(limit=3)
+        return None, diag
 
-    _HAS_TRADE_CONTEXT_EXPORTER = True
-except Exception:
-    export_trade_context = None
-    _HAS_TRADE_CONTEXT_EXPORTER = False
+
+export_trade_context, _TRADE_CONTEXT_IMPORT_DIAG = _load_trade_context_exporter()
+_HAS_TRADE_CONTEXT_EXPORTER = bool(_TRADE_CONTEXT_IMPORT_DIAG.get("ok"))
 
 RAW_NDJSON_GLOB = "coinbase_*.ndjson"
 HEARTBEAT_STALE_SEC = float(os.environ.get("TJTB_HEARTBEAT_STALE_SEC", "90"))
@@ -284,6 +304,19 @@ def main() -> None:
     st.subheader("Log files (paths only)")
     st.text(f"live_bot: {LIVE_BOT_LOG_PATH.resolve()}")
     st.text(f"dashboard: {DASHBOARD_LOG_PATH.resolve()}")
+
+    st.subheader("Trade Context Import Diagnostics")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Importer status", "OK" if _HAS_TRADE_CONTEXT_EXPORTER else "FAILED")
+    d2.metric("PYTHONPATH set", "yes" if _TRADE_CONTEXT_IMPORT_DIAG.get("py_path") else "no")
+    d3.metric("src in sys.path", "yes" if str(_SRC) in sys.path else "no")
+    st.caption(f"Module: `{_TRADE_CONTEXT_IMPORT_DIAG.get('module')}`")
+    st.caption(f"Loaded from: `{_TRADE_CONTEXT_IMPORT_DIAG.get('module_file') or 'n/a'}`")
+    if not _HAS_TRADE_CONTEXT_EXPORTER:
+        st.error(f"Import failed: {_TRADE_CONTEXT_IMPORT_DIAG.get('exception') or 'unknown error'}")
+        tb = _TRADE_CONTEXT_IMPORT_DIAG.get("traceback")
+        if tb:
+            st.code(str(tb), language="text")
 
     if trade_rows is not None and trade_rows == 0:
         st.warning("No paper trade rows yet (file may be header-only or empty). Strategy may be waiting for signals or feed.")
