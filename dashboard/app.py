@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 import csv
+import io
+import json
 import shutil
 import subprocess
 import sys
 import time
 import traceback
+import zipfile
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
@@ -148,6 +151,119 @@ def _parse_context_msg(msg: str | None) -> dict[str, str]:
         else:
             out[token] = ""
     return out
+
+
+def _latest_raw_file_info() -> tuple[str | None, int | None]:
+    files = [p for p in RAW_DATA_DIR.glob(RAW_NDJSON_GLOB) if p.is_file()]
+    if not files:
+        return None, None
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    try:
+        return latest.name, int(latest.stat().st_size)
+    except OSError:
+        return latest.name, None
+
+
+def _build_debug_bundle(
+    trades_df: pd.DataFrame,
+    opportunities_df: pd.DataFrame,
+    exporter_fn: object | None,
+) -> bytes:
+    buf = io.BytesIO()
+    manifest: dict[str, object] = {
+        "generated_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "project_root": str(PROJECT_ROOT),
+        "paper_trades_row_count": int(len(trades_df)),
+        "opportunities_row_count": int(len(opportunities_df)),
+    }
+    latest_raw_name, latest_raw_size = _latest_raw_file_info()
+    manifest["latest_raw_ndjson_file_name"] = latest_raw_name
+    manifest["latest_raw_ndjson_size"] = latest_raw_size
+    manifest["trade_context_exports"] = []
+    manifest["trade_context_errors"] = []
+
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if PAPER_TRADES_PATH.is_file():
+            zf.write(PAPER_TRADES_PATH, arcname="paper_trades.csv")
+        else:
+            zf.writestr("paper_trades.csv", "")
+        if OPPORTUNITIES_PATH.is_file():
+            zf.write(OPPORTUNITIES_PATH, arcname="opportunities.csv")
+        else:
+            zf.writestr("opportunities.csv", "")
+
+        heartbeat_info = {
+            "heartbeat_path": str(HEARTBEAT_PATH),
+            "heartbeat_exists": HEARTBEAT_PATH.is_file(),
+            "heartbeat_age_sec": _heartbeat_age_sec(),
+            "feed_status": _raw_feed_status()[0],
+        }
+        if HEARTBEAT_PATH.is_file():
+            try:
+                heartbeat_info["heartbeat_text"] = HEARTBEAT_PATH.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                heartbeat_info["heartbeat_read_error"] = str(exc)
+        zf.writestr("heartbeat_status.json", json.dumps(heartbeat_info, ensure_ascii=True, indent=2))
+
+        if LIVE_BOT_LOG_PATH.is_file():
+            zf.write(LIVE_BOT_LOG_PATH, arcname="logs/live_bot.log")
+        if DASHBOARD_LOG_PATH.is_file():
+            zf.write(DASHBOARD_LOG_PATH, arcname="logs/dashboard.log")
+
+        if callable(exporter_fn) and not trades_df.empty:
+            trades_sorted = trades_df.sort_values("_entry_ts", ascending=False, na_position="last").head(10)
+            required_ctx_cols = [
+                "phase",
+                "ts",
+                "price",
+                "bid",
+                "ask",
+                "bid_size",
+                "ask_size",
+                "spread",
+                "volume",
+                "buy_volume",
+                "sell_volume",
+                "delta",
+                "imbalance",
+                "raw_json",
+            ]
+            for idx, (_, row) in enumerate(trades_sorted.iterrows(), start=1):
+                entry_ts = str(row.get("entry_ts", "") or "")
+                exit_ts = str(row.get("exit_ts", "") or "")
+                out_name = f"trade_context_{idx:03d}.csv"
+                if not entry_ts:
+                    manifest["trade_context_errors"].append({"file": out_name, "error": "missing_entry_ts"})
+                    continue
+                try:
+                    export_result = exporter_fn(
+                        entry_ts=entry_ts,
+                        exit_ts=exit_ts if exit_ts else None,
+                        before_seconds=120,
+                        after_seconds=120,
+                    )
+                    if isinstance(export_result, tuple) and len(export_result) >= 3:
+                        ctx_df, _ctx_path, ctx_msg = export_result[0], export_result[1], export_result[2]
+                    else:
+                        ctx_df, _ctx_path = export_result
+                        ctx_msg = None
+                    ctx_export = ctx_df.copy()
+                    if "ts" not in ctx_export.columns and "timestamp" in ctx_export.columns:
+                        ctx_export["ts"] = ctx_export["timestamp"]
+                    use_cols = [c for c in required_ctx_cols if c in ctx_export.columns]
+                    payload = (ctx_export[use_cols] if use_cols else ctx_export).to_csv(index=False).encode("utf-8")
+                    zf.writestr(f"trade_context/{out_name}", payload)
+                    manifest["trade_context_exports"].append(
+                        {"file": out_name, "entry_ts": entry_ts, "exit_ts": exit_ts or None, "rows": int(len(ctx_export)), "status": str(ctx_msg or "ok")}
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    manifest["trade_context_errors"].append(
+                        {"file": out_name, "entry_ts": entry_ts, "exit_ts": exit_ts or None, "error": f"{exc.__class__.__name__}: {exc}"}
+                    )
+
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2))
+
+    return buf.getvalue()
 
 
 def _opportunities_invalid(df: pd.DataFrame) -> bool:
@@ -429,6 +545,14 @@ def main() -> None:
 
     df = load_paper_trades(PAPER_TRADES_PATH)
     opps, opps_fallback_applied = load_opportunities(OPPORTUNITIES_PATH)
+    bundle_bytes = _build_debug_bundle(df, opps, export_trade_context if _HAS_TRADE_CONTEXT_EXPORTER else None)
+    st.download_button(
+        "Download full debug bundle",
+        data=bundle_bytes,
+        file_name=f"tjtb_debug_bundle_{datetime.now(tz=timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.zip",
+        mime="application/zip",
+        key="tjtb_download_full_debug_bundle",
+    )
     opps_missing_cols = _missing_required_columns(opps, EXPECTED_OPP_COLS) if not opps.empty else []
     valid_trades = df[df.get("_valid_trade", pd.Series(False, index=df.index)).fillna(False)].copy() if not df.empty else df
     chron = valid_trades.sort_values("_exit_ts", na_position="last", ascending=True) if not valid_trades.empty else valid_trades
