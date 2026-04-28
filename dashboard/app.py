@@ -251,7 +251,7 @@ def load_paper_trades(path: Path) -> pd.DataFrame:
     for c in EXPECTED_TRADE_COLS:
         if c not in df.columns:
             df[c] = pd.NA
-    df = df[EXPECTED_TRADE_COLS].copy()
+    df = df.copy()
     for c in ("entry_price", "exit_price", "r_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["_exit_ts"] = pd.to_datetime(df["exit_ts"], utc=True, errors="coerce")
@@ -286,7 +286,10 @@ def load_opportunities(path: Path) -> tuple[pd.DataFrame, bool]:
             return pd.DataFrame(columns=EXPECTED_OPP_COLS), False
         df = df_fallback.copy()
         fallback_applied = True
-    normalized = df[EXPECTED_OPP_COLS].copy()
+    normalized = df.copy()
+    for c in EXPECTED_OPP_COLS:
+        if c not in normalized.columns:
+            normalized[c] = pd.NA
     return normalized, fallback_applied
 
 
@@ -369,21 +372,47 @@ def main() -> None:
     elif feed_state == "STALE":
         st.warning("NDJSON file(s) exist but look stale — recorder may have stopped.")
 
-    st.subheader("Canonical file paths")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        trade_rows, _ = _render_path_card("Paper trades CSV", PAPER_TRADES_PATH)
-    with c2:
-        opp_rows, _ = _render_path_card("Opportunities CSV", OPPORTUNITIES_PATH)
-    with c3:
-        st.markdown("**Heartbeat file**")
-        st.code(str(HEARTBEAT_PATH.resolve()), language="text")
-        if not HEARTBEAT_PATH.is_file():
-            st.warning("Missing heartbeat.txt")
+    st.subheader("Live opportunities & trades")
+    ocol, tcol = st.columns(2)
+    with ocol:
+        opp_preview, opp_preview_err = _read_csv_safe(OPPORTUNITIES_PATH)
+        if opp_preview_err is not None or opp_preview.empty:
+            st.warning(f"Could not load opportunities preview ({opp_preview_err or 'empty_file'})")
         else:
-            st.caption(
-                f"Last modified: **{_file_mtime_iso(HEARTBEAT_PATH) or '—'}** · Size: **{_file_size_bytes(HEARTBEAT_PATH)}** bytes · age_sec≈**{hb_age if hb_age is not None else '—'}**"
-            )
+            for c in ("bid", "ask", "bid_size", "ask_size"):
+                if c not in opp_preview.columns:
+                    opp_preview[c] = pd.NA
+            opp_preview_cols = [c for c in ["ts", "anomaly_percentile", "anomaly_score", "direction", "regime", "action", "bid", "ask", "bid_size", "ask_size"] if c in opp_preview.columns]
+            st.caption(f"Showing latest 50 opportunities rows (total={len(opp_preview)})")
+            st.dataframe(opp_preview[opp_preview_cols].tail(50), use_container_width=True, hide_index=True)
+    with tcol:
+        trade_preview, trade_preview_err = _read_csv_safe(PAPER_TRADES_PATH)
+        if trade_preview_err is not None or trade_preview.empty:
+            st.warning(f"Could not load trades preview ({trade_preview_err or 'empty_file'})")
+        else:
+            for c in ("bid", "ask", "bid_size", "ask_size"):
+                if c not in trade_preview.columns:
+                    trade_preview[c] = pd.NA
+            trade_preview_cols = [
+                c
+                for c in [
+                    "exit_ts",
+                    "entry_ts",
+                    "side",
+                    "entry_price",
+                    "exit_price",
+                    "outcome",
+                    "r_value",
+                    "regime",
+                    "bid",
+                    "ask",
+                    "bid_size",
+                    "ask_size",
+                ]
+                if c in trade_preview.columns
+            ]
+            st.caption(f"Showing latest 50 trades rows (total={len(trade_preview)})")
+            st.dataframe(trade_preview[trade_preview_cols].tail(50), use_container_width=True, hide_index=True)
 
     st.subheader("Log files (paths only)")
     st.text(f"live_bot: {LIVE_BOT_LOG_PATH.resolve()}")
@@ -554,8 +583,28 @@ def main() -> None:
         mime="text/csv",
         key="tjtb_download_opportunities_csv",
     )
+    for c in ("bid", "ask", "bid_size", "ask_size"):
+        if c not in opps.columns:
+            opps[c] = pd.NA
+    opps_display_cols = [
+        c
+        for c in [
+            "ts",
+            "anomaly_percentile",
+            "anomaly_score",
+            "direction",
+            "regime",
+            "action",
+            "reason",
+            "bid",
+            "ask",
+            "bid_size",
+            "ask_size",
+        ]
+        if c in opps.columns
+    ]
     st.caption(f"opportunities.csv row count: **{len(opps)}**")
-    st.dataframe(opps.tail(50), use_container_width=True, hide_index=True)
+    st.dataframe(opps[opps_display_cols].tail(50), use_container_width=True, hide_index=True)
 
     st.subheader("Paper trades table")
     if trades_csv_err is not None:
@@ -564,7 +613,27 @@ def main() -> None:
     elif trades_missing_cols:
         st.warning("paper_trades.csv schema/data invalid")
         st.info(f"Missing required columns: {trades_missing_cols}")
-    display_cols = ["exit_ts", "entry_ts", "side", "entry_price", "exit_price", "outcome", "r_value", "regime"]
+    for c in ("bid", "ask", "bid_size", "ask_size"):
+        if c not in df.columns:
+            df[c] = pd.NA
+    display_cols = [
+        c
+        for c in [
+            "exit_ts",
+            "entry_ts",
+            "side",
+            "entry_price",
+            "exit_price",
+            "outcome",
+            "r_value",
+            "regime",
+            "bid",
+            "ask",
+            "bid_size",
+            "ask_size",
+        ]
+        if c in df.columns
+    ]
     table = df.sort_values("_exit_ts", ascending=False, na_position="last")[display_cols].copy() if not df.empty else pd.DataFrame(columns=display_cols)
     st.download_button(
         "Download paper_trades.csv",
