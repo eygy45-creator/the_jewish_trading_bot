@@ -48,6 +48,21 @@ def _pick_ts(obj: dict[str, Any]) -> pd.Timestamp | None:
     return None
 
 
+def sample_raw_event_keys(max_files: int = 1, max_objects_per_file: int = 200) -> list[str]:
+    files = sorted([p for p in RAW_DATA_DIR.glob(RAW_NDJSON_GLOB) if p.is_file()], key=lambda x: x.stat().st_mtime)
+    if not files:
+        return []
+    keys: set[str] = set()
+    for path in files[-max_files:]:
+        n = 0
+        for obj in _iter_json_objects(path):
+            keys.update(obj.keys())
+            n += 1
+            if n >= max_objects_per_file:
+                break
+    return sorted(keys)
+
+
 def _first_present(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     for col in candidates:
         if col in df.columns:
@@ -181,10 +196,16 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
                         if not isinstance(tr, dict):
                             continue
                         raw_keys.update(tr.keys())
+                        ts = _pick_ts(tr)
+                        if ts is None:
+                            ts = _pick_ts(ev)
+                        if ts is None or ts < window.start_ts or ts > window.end_ts:
+                            continue
                         side = str(tr.get("side", "")).lower()
                         size = _safe_float(tr.get("size"))
                         if size is None:
                             size = _safe_float(tr.get("qty"))
+                        price = _safe_float(tr.get("price"))
                         if size is None:
                             continue
                         if side in {"buy", "bid"}:
@@ -193,6 +214,39 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
                         elif side in {"sell", "ask", "offer"}:
                             sell_volume += size
                             sell_count += 1
+                        best_bid = max(bids.keys()) if bids else None
+                        best_ask = min(asks.keys()) if asks else None
+                        bid_sz = bids.get(best_bid, 0.0) if best_bid is not None else None
+                        ask_sz = asks.get(best_ask, 0.0) if best_ask is not None else None
+                        spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None and best_ask > best_bid) else None
+                        denom = (bid_sz or 0.0) + (ask_sz or 0.0)
+                        imbalance = (((bid_sz or 0.0) - (ask_sz or 0.0)) / denom) if denom > 0 else None
+                        microprice = (
+                            ((best_ask * (bid_sz or 0.0)) + (best_bid * (ask_sz or 0.0))) / denom
+                            if denom > 0 and best_bid is not None and best_ask is not None
+                            else None
+                        )
+                        rows.append(
+                            {
+                                "ts": ts,
+                                "bid": best_bid,
+                                "ask": best_ask,
+                                "bid_size": bid_sz,
+                                "ask_size": ask_sz,
+                                "price": price,
+                                "size": size,
+                                "side": side,
+                                "buy_volume": buy_volume,
+                                "sell_volume": sell_volume,
+                                "aggressive_buyers": buy_count,
+                                "aggressive_sellers": sell_count,
+                                "imbalance": imbalance,
+                                "queue_imbalance": imbalance,
+                                "microprice": microprice,
+                                "spread": spread,
+                                "raw_json": json.dumps(tr, ensure_ascii=True),
+                            }
+                        )
                 continue
 
             if channel != "l2_data":
@@ -238,42 +292,44 @@ def _build_raw_context(window: TradeWindow) -> tuple[pd.DataFrame, set[str]]:
 
                     if ts < window.start_ts or ts > window.end_ts:
                         continue
-                    if not bids or not asks:
+                    best_bid = max(bids.keys()) if bids else None
+                    best_ask = min(asks.keys()) if asks else None
+                    if best_bid is not None and best_ask is not None and best_bid >= best_ask:
                         continue
-                    best_bid = max(bids.keys())
-                    best_ask = min(asks.keys())
-                    if best_bid >= best_ask:
-                        continue
-                    mid = (best_bid + best_ask) / 2.0
-                    spread = best_ask - best_bid
-                    bid_sz = bids.get(best_bid, 0.0)
-                    ask_sz = asks.get(best_ask, 0.0)
-                    denom = bid_sz + ask_sz
-                    imbalance = ((bid_sz - ask_sz) / denom) if denom > 0 else None
-                    microprice = ((best_ask * bid_sz) + (best_bid * ask_sz)) / denom if denom > 0 else None
+                    bid_sz = bids.get(best_bid, 0.0) if best_bid is not None else None
+                    ask_sz = asks.get(best_ask, 0.0) if best_ask is not None else None
+                    bid_sz_f = float(bid_sz) if bid_sz is not None else 0.0
+                    ask_sz_f = float(ask_sz) if ask_sz is not None else 0.0
+                    denom = bid_sz_f + ask_sz_f
+                    imbalance = ((bid_sz_f - ask_sz_f) / denom) if denom > 0 else None
+                    microprice = ((best_ask * bid_sz_f) + (best_bid * ask_sz_f)) / denom if denom > 0 and best_bid is not None and best_ask is not None else None
+                    spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
                     rows.append(
                         {
-                            "timestamp": ts,
-                            "best_bid": best_bid,
-                            "best_ask": best_ask,
+                            "ts": ts,
+                            "bid": best_bid,
+                            "ask": best_ask,
                             "bid_size": bid_sz,
                             "ask_size": ask_sz,
-                            "mid_price": mid,
                             "microprice": microprice,
                             "spread": spread,
+                            "price": px,
+                            "size": qty,
+                            "side": side,
                             "buy_volume": buy_volume,
-                            "aggressive_buy_count": buy_count,
                             "sell_volume": sell_volume,
-                            "aggressive_sell_count": sell_count,
+                            "aggressive_buyers": buy_count,
+                            "aggressive_sellers": sell_count,
                             "imbalance": imbalance,
                             "queue_imbalance": imbalance,
+                            "raw_json": json.dumps(up, ensure_ascii=True),
                         }
                     )
 
     if not rows:
         return pd.DataFrame(), raw_keys
     out = pd.DataFrame(rows)
-    out = out.sort_values("timestamp", ascending=True).drop_duplicates(subset=["timestamp"], keep="last")
+    out = out.sort_values("ts", ascending=True).drop_duplicates(subset=["ts", "side", "price", "size"], keep="last")
     return out.reset_index(drop=True), raw_keys
 
 
@@ -289,25 +345,22 @@ def _row_phase(ts: pd.Timestamp, window: TradeWindow) -> str:
 
 def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     wanted = [
-        "timestamp",
-        "best_bid",
-        "best_ask",
+        "ts",
         "bid",
         "ask",
         "bid_size",
         "ask_size",
-        "mid_price",
+        "price",
+        "size",
+        "side",
         "microprice",
         "spread",
         "buy_volume",
-        "aggressive_buy_count",
         "aggressive_buyers",
         "sell_volume",
-        "aggressive_sell_count",
         "aggressive_sellers",
         "imbalance",
         "queue_imbalance",
-        "volatility_context",
         "volatility",
         "anomaly_score",
         "anomaly_percentile",
@@ -316,6 +369,7 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
         "action",
         "trade_ref",
         "row_phase",
+        "raw_json",
     ]
     out = df.copy()
     for c in wanted:
@@ -345,35 +399,35 @@ def export_trade_context(
         status_parts.append("opportunities context unavailable")
 
     if raw_df.empty and not opp_df.empty:
-        merged = opp_df.copy()
+        merged = opp_df.rename(columns={"timestamp": "ts"}).copy()
     elif raw_df.empty and opp_df.empty:
-        merged = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[ns, UTC]")})
+        merged = pd.DataFrame({"ts": pd.Series(dtype="datetime64[ns, UTC]")})
     elif opp_df.empty:
         merged = raw_df.copy()
     else:
-        merged = pd.merge(raw_df, opp_df, on="timestamp", how="left")
+        left = raw_df.copy()
+        left["ts"] = pd.to_datetime(left["ts"], utc=True, errors="coerce")
+        right = opp_df.rename(columns={"timestamp": "ts"}).copy()
+        right["ts"] = pd.to_datetime(right["ts"], utc=True, errors="coerce")
+        left = left.sort_values("ts")
+        right = right.sort_values("ts")
+        merged = pd.merge_asof(left, right, on="ts", direction="nearest", tolerance=pd.Timedelta(seconds=1))
 
-    merged["timestamp"] = pd.to_datetime(merged.get("timestamp"), utc=True, errors="coerce")
-    merged = merged.dropna(subset=["timestamp"]).sort_values("timestamp")
+    merged["ts"] = pd.to_datetime(merged.get("ts"), utc=True, errors="coerce")
+    merged = merged.dropna(subset=["ts"]).sort_values("ts")
     merged["trade_ref"] = window.trade_ref
-    merged["row_phase"] = merged["timestamp"].apply(lambda ts: _row_phase(ts, window))
-    if "mid_price" in merged.columns:
-        mid = pd.to_numeric(merged["mid_price"], errors="coerce")
-        ret = mid.pct_change()
-        merged["volatility_context"] = ret.rolling(window=20, min_periods=5).std()
-    merged["bid"] = merged.get("best_bid")
-    merged["ask"] = merged.get("best_ask")
-    merged["aggressive_buyers"] = merged.get("aggressive_buy_count")
-    merged["aggressive_sellers"] = merged.get("aggressive_sell_count")
-    merged["volatility"] = merged.get("volatility_context")
+    merged["row_phase"] = merged["ts"].apply(lambda ts: _row_phase(ts, window))
+    price_for_vol = pd.to_numeric(merged.get("microprice"), errors="coerce")
+    ret = price_for_vol.pct_change()
+    merged["volatility"] = ret.rolling(window=20, min_periods=5).std()
     if not merged.empty:
-        nearest_entry_idx = (merged["timestamp"] - window.entry_ts).abs().idxmin()
+        nearest_entry_idx = (merged["ts"] - window.entry_ts).abs().idxmin()
         merged.loc[nearest_entry_idx, "row_phase"] = "entry"
-        nearest_exit_idx = (merged["timestamp"] - window.exit_ts).abs().idxmin()
+        nearest_exit_idx = (merged["ts"] - window.exit_ts).abs().idxmin()
         merged.loc[nearest_exit_idx, "row_phase"] = "exit"
 
     merged = _ensure_required_columns(merged)
-    merged["timestamp"] = merged["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    merged["ts"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     merged = merged.replace({pd.NA: None})
 
     out_dir = output_dir or LIVE_DATA_DIR
@@ -381,10 +435,14 @@ def export_trade_context(
     output_path = out_dir / f"trade_context_{_sanitize_ts_for_filename(window.trade_ref)}.csv"
     merged.to_csv(output_path, index=False, encoding="utf-8")
     required_micro_cols = [
+        "ts",
         "bid",
         "ask",
         "bid_size",
         "ask_size",
+        "price",
+        "size",
+        "side",
         "buy_volume",
         "sell_volume",
         "aggressive_buyers",
@@ -398,6 +456,7 @@ def export_trade_context(
         "anomaly_percentile",
         "regime",
         "action",
+        "raw_json",
     ]
     missing_micro = [c for c in required_micro_cols if c not in merged.columns or merged[c].isna().all()]
     if missing_micro:
