@@ -77,6 +77,31 @@ EXPECTED_OPP_COLS = [
 ]
 
 
+def _read_csv_safe(path: Path) -> tuple[pd.DataFrame, str | None]:
+    if not path.is_file():
+        return pd.DataFrame(), "missing_file"
+    try:
+        return pd.read_csv(path, encoding="utf-8"), None
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(), "empty_file"
+    except (OSError, pd.errors.ParserError):
+        return pd.DataFrame(), "parse_error"
+
+
+def _missing_required_columns(df: pd.DataFrame, expected_cols: list[str]) -> list[str]:
+    return [c for c in expected_cols if c not in df.columns]
+
+
+def _opportunities_invalid(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return True
+    ts = pd.to_datetime(df.get("ts"), utc=True, errors="coerce")
+    score = pd.to_numeric(df.get("anomaly_score"), errors="coerce")
+    pct = pd.to_numeric(df.get("anomaly_percentile"), errors="coerce")
+    signal_like = ts.notna() | score.notna() | pct.notna()
+    return not bool(signal_like.any())
+
+
 def _pgrep_f(pat: str) -> bool:
     r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
     return r.returncode == 0 and bool((r.stdout or "").strip())
@@ -185,9 +210,9 @@ def load_paper_trades(path: Path) -> pd.DataFrame:
     df = df[EXPECTED_TRADE_COLS].copy()
     for c in ("entry_price", "exit_price", "r_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["r_value"])
     df["_exit_ts"] = pd.to_datetime(df["exit_ts"], utc=True, errors="coerce")
     df["_entry_ts"] = pd.to_datetime(df["entry_ts"], utc=True, errors="coerce")
+    df["_valid_trade"] = df["r_value"].notna()
     return df
 
 
@@ -323,18 +348,72 @@ def main() -> None:
     if opp_rows is not None and opp_rows == 0:
         st.warning("No opportunity rows yet — no bearish 99pct signals logged to CSV, or bot not processing feed.")
 
+    raw_trades_csv, trades_csv_err = _read_csv_safe(PAPER_TRADES_PATH)
+    raw_opps_csv, opps_csv_err = _read_csv_safe(OPPORTUNITIES_PATH)
+    trades_missing_cols = _missing_required_columns(raw_trades_csv, EXPECTED_TRADE_COLS) if not raw_trades_csv.empty else []
+    opps_missing_cols = _missing_required_columns(raw_opps_csv, EXPECTED_OPP_COLS) if not raw_opps_csv.empty else []
+
+    with st.expander("Debug: CSV diagnostics", expanded=False):
+        st.markdown("**paper_trades.csv**")
+        st.write(f"path: `{PAPER_TRADES_PATH}`")
+        st.write(f"exists: `{PAPER_TRADES_PATH.is_file()}`")
+        st.write(f"row_count(excl header): `{_csv_data_row_count(PAPER_TRADES_PATH)}`")
+        st.write(f"last_modified: `{_file_mtime_iso(PAPER_TRADES_PATH)}`")
+        st.write(f"columns: `{list(raw_trades_csv.columns) if not raw_trades_csv.empty else []}`")
+        if not raw_trades_csv.empty:
+            st.write("first 3 rows")
+            st.dataframe(raw_trades_csv.head(3), use_container_width=True, hide_index=True)
+            st.write("last 3 rows")
+            st.dataframe(raw_trades_csv.tail(3), use_container_width=True, hide_index=True)
+        else:
+            st.caption(f"paper_trades.csv read status: {trades_csv_err or 'ok'}")
+
+        st.markdown("**opportunities.csv**")
+        st.write(f"path: `{OPPORTUNITIES_PATH}`")
+        st.write(f"exists: `{OPPORTUNITIES_PATH.is_file()}`")
+        st.write(f"row_count(excl header): `{_csv_data_row_count(OPPORTUNITIES_PATH)}`")
+        st.write(f"last_modified: `{_file_mtime_iso(OPPORTUNITIES_PATH)}`")
+        st.write(f"columns: `{list(raw_opps_csv.columns) if not raw_opps_csv.empty else []}`")
+        if not raw_opps_csv.empty:
+            st.write("first 3 rows")
+            st.dataframe(raw_opps_csv.head(3), use_container_width=True, hide_index=True)
+            st.write("last 3 rows")
+            st.dataframe(raw_opps_csv.tail(3), use_container_width=True, hide_index=True)
+        else:
+            st.caption(f"opportunities.csv read status: {opps_csv_err or 'ok'}")
+
     df = load_paper_trades(PAPER_TRADES_PATH)
     opps = load_opportunities(OPPORTUNITIES_PATH)
+    valid_trades = df[df.get("_valid_trade", pd.Series(False, index=df.index)).fillna(False)].copy() if not df.empty else df
 
     st.subheader("Opportunities table (newest at bottom of tail)")
-    if opps.empty:
+    if opps_csv_err is not None:
+        st.warning("opportunities.csv schema/data invalid")
+        st.info(f"opportunities.csv read status: {opps_csv_err}")
+    elif opps_missing_cols:
+        st.warning("opportunities.csv schema/data invalid")
+        st.info(f"Missing required columns: {opps_missing_cols}")
+    elif opps.empty or _opportunities_invalid(opps):
+        st.warning("opportunities.csv schema/data invalid")
+        if opps.empty:
+            st.info("No opportunity rows in memory (empty file or parse issue).")
+        else:
+            st.info("Rows exist but do not contain valid ts/anomaly signal values.")
+        st.dataframe(opps, use_container_width=True, hide_index=True)
+    elif opps.empty:
         st.info("No opportunity rows in memory (empty file or parse issue).")
     else:
         st.dataframe(opps, use_container_width=True, hide_index=True)
 
     st.subheader("Paper trades table (newest first)")
+    if trades_csv_err is not None:
+        st.warning("paper_trades.csv schema/data invalid")
+        st.info(f"paper_trades.csv read status: {trades_csv_err}")
+    elif trades_missing_cols:
+        st.warning("paper_trades.csv schema/data invalid")
+        st.info(f"Missing required columns: {trades_missing_cols}")
     if df.empty:
-        st.info("No closed trades loaded (no data rows with valid r_value).")
+        st.info("No closed trades loaded (file empty, missing, or schema-invalid).")
     else:
         display_cols = [
             "exit_ts",
@@ -396,11 +475,11 @@ def main() -> None:
             except (ValueError, OSError) as exc:
                 st.error(f"Could not export trade context: {exc}")
 
-        chron = df.sort_values("_exit_ts", na_position="last", ascending=True)
+        chron = valid_trades.sort_values("_exit_ts", na_position="last", ascending=True) if not valid_trades.empty else valid_trades
         r = chron["r_value"]
         cum_r = r.cumsum()
-        wins = (r > 0).sum()
-        n = int(len(df))
+        wins = (r > 0).sum() if not r.empty else 0
+        n = int(len(chron))
         total_r = float(r.sum())
         win_rate = float(wins / n) if n else 0.0
         avg_r = float(r.mean()) if n else 0.0
@@ -421,9 +500,24 @@ def main() -> None:
         c7.metric("Max drawdown (R)", f"{mdd_r:,.3f}")
         c8.metric("Max losing streak", f"{lose_streak:,}")
 
+        st.subheader("EV (R expectancy)")
+        if n < 2:
+            st.info("not enough trades for EV chart")
+        else:
+            ev_df = pd.DataFrame(
+                {
+                    "trade #": range(1, len(chron) + 1),
+                    "ev_R": r.expanding(min_periods=1).mean().values,
+                }
+            )
+            st.line_chart(ev_df, x="trade #", y="ev_R")
+
         st.subheader("Cumulative equity (R)")
-        equity_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "equity_R": cum_r.values})
-        st.line_chart(equity_df, x="trade #", y="equity_R")
+        if n < 1:
+            st.info("Not enough valid trades for equity chart.")
+        else:
+            equity_df = pd.DataFrame({"trade #": range(1, len(chron) + 1), "equity_R": cum_r.values})
+            st.line_chart(equity_df, x="trade #", y="equity_R")
 
         st.subheader("Breakdown")
         b1, b2, b3 = st.columns(3)
