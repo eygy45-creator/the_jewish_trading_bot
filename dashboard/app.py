@@ -409,109 +409,157 @@ def main() -> None:
     if strict_df_err is not None or strict_summary_err is not None or missing_cols:
         st.warning("Run strict_prop_simulation.py first")
     else:
-        metrics = strict_summary.get("metrics", {}) if isinstance(strict_summary, dict) else {}
-        if not isinstance(metrics, dict):
-            metrics = {}
-        start_balance = strict_summary.get("starting_balance", 5000.0)
-        final_balance = metrics.get("final_balance")
-        net_pnl = metrics.get("net_pnl")
-        if not isinstance(net_pnl, (int, float)) and isinstance(final_balance, (int, float)) and isinstance(start_balance, (int, float)):
-            net_pnl = float(final_balance) - float(start_balance)
-        return_pct = metrics.get("return_pct")
-        if not isinstance(return_pct, (int, float)) and isinstance(final_balance, (int, float)) and isinstance(start_balance, (int, float)) and float(start_balance) != 0.0:
-            return_pct = ((float(final_balance) / float(start_balance)) - 1.0) * 100.0
-        total_fees = metrics.get("total_fees") if isinstance(metrics.get("total_fees"), (int, float)) else metrics.get("total_fees_paid")
-        max_dd_usd = metrics.get("max_drawdown")
-        max_dd_pct = metrics.get("max_drawdown_pct")
-        if not isinstance(max_dd_pct, (int, float)) and isinstance(max_dd_usd, (int, float)) and isinstance(start_balance, (int, float)) and float(start_balance) != 0.0:
-            max_dd_pct = (float(max_dd_usd) / float(start_balance)) * 100.0
-        verdict = strict_summary.get("verdict", "n/a")
-        if isinstance(verdict, dict):
-            verdict = verdict.get("label", "n/a")
-        pf = metrics.get("profit_factor")
-        pf_text = "inf" if bool(metrics.get("profit_factor_is_infinite")) else (f"{float(pf):.4f}" if isinstance(pf, (int, float)) else "n/a")
+        profiles = strict_summary.get("profiles", {}) if isinstance(strict_summary, dict) else {}
+        if not isinstance(profiles, dict) or not profiles:
+            st.warning("Run strict_prop_simulation.py first")
+        else:
+            # Side-by-side comparison for all profiles.
+            cmp_rows: list[dict[str, object]] = []
+            for profile_name in ("realistic", "conservative", "extreme"):
+                p = profiles.get(profile_name, {})
+                if not isinstance(p, dict):
+                    continue
+                m = p.get("metrics", {})
+                c = p.get("cost_model", {})
+                if not isinstance(m, dict):
+                    m = {}
+                if not isinstance(c, dict):
+                    c = {}
+                pf_value = m.get("profit_factor")
+                pf_text_cmp = "inf" if bool(m.get("profit_factor_is_infinite")) else (f"{float(pf_value):.4f}" if isinstance(pf_value, (int, float)) else "n/a")
+                cmp_rows.append(
+                    {
+                        "profile": profile_name,
+                        "final_balance": m.get("final_balance"),
+                        "net_pnl": m.get("net_pnl"),
+                        "total_fees": m.get("total_fees"),
+                        "max_drawdown": m.get("max_drawdown"),
+                        "win_rate": m.get("win_rate"),
+                        "average_r": m.get("average_r"),
+                        "profit_factor": pf_text_cmp,
+                        "verdict": m.get("verdict"),
+                        "cost_per_trade": c.get("cost_per_trade"),
+                        "cost_in_R": c.get("cost_in_r"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
 
-        a1, a2, a3, a4, a5 = st.columns(5)
-        a6, a7, a8, a9, a10, a11 = st.columns(6)
-        a1.metric("Starting Balance", f"${float(start_balance):,.2f}" if isinstance(start_balance, (int, float)) else "n/a")
-        a2.metric("Final Balance ($)", f"${float(final_balance):,.2f}" if isinstance(final_balance, (int, float)) else "n/a")
-        a3.metric("Net Profit / Loss ($)", f"${float(net_pnl):,.2f}" if isinstance(net_pnl, (int, float)) else "n/a")
-        a4.metric("Return (%)", f"{float(return_pct):.2f}%" if isinstance(return_pct, (int, float)) else "n/a")
-        a5.metric("Total Fees Paid ($)", f"${float(total_fees):,.2f}" if isinstance(total_fees, (int, float)) else "n/a")
-        a6.metric(
-            "Max Drawdown ($ and %)",
-            (
-                f"${float(max_dd_usd):,.2f} ({float(max_dd_pct):.2f}%)"
-                if isinstance(max_dd_usd, (int, float)) and isinstance(max_dd_pct, (int, float))
-                else "n/a"
-            ),
-        )
-        a7.metric("Profit Factor", pf_text)
-        a8.metric("Win Rate", f"{float(metrics.get('win_rate')):.2%}" if isinstance(metrics.get("win_rate"), (int, float)) else "n/a")
-        a9.metric("Average Net R", f"{float(metrics.get('average_r')):.4f}" if isinstance(metrics.get("average_r"), (int, float)) else "n/a")
-        a10.metric(
-            "Max Losing Streak",
-            f"{int(metrics.get('max_losing_streak')):,}" if isinstance(metrics.get("max_losing_streak"), (int, float)) else "n/a",
-        )
-        a11.metric("Pass / Fail Verdict", str(verdict))
+            selected_profile = st.selectbox(
+                "Cost profile",
+                options=["realistic", "conservative", "extreme"],
+                index=2,
+                key="tjtb_strict_profile",
+            )
 
-        strict_plot = strict_df.copy()
-        for c in ("trade_number", "gross_pnl", "execution_costs", "net_pnl", "balance_after_trade", "drawdown", "net_r"):
-            strict_plot[c] = pd.to_numeric(strict_plot[c], errors="coerce")
-        strict_plot = strict_plot.dropna(subset=["trade_number"]).sort_values("trade_number", ascending=True)
-        strict_plot["fees_cum_usd"] = strict_plot["execution_costs"].fillna(0.0).cumsum()
+            selected = profiles.get(selected_profile, {})
+            metrics = selected.get("metrics", {}) if isinstance(selected, dict) else {}
+            if not isinstance(metrics, dict):
+                metrics = {}
+            start_balance = strict_summary.get("starting_balance", 5000.0)
+            final_balance = metrics.get("final_balance")
+            net_pnl = metrics.get("net_pnl")
+            if not isinstance(net_pnl, (int, float)) and isinstance(final_balance, (int, float)) and isinstance(start_balance, (int, float)):
+                net_pnl = float(final_balance) - float(start_balance)
+            return_pct = metrics.get("return_pct")
+            if not isinstance(return_pct, (int, float)) and isinstance(final_balance, (int, float)) and isinstance(start_balance, (int, float)) and float(start_balance) != 0.0:
+                return_pct = ((float(final_balance) / float(start_balance)) - 1.0) * 100.0
+            total_fees = metrics.get("total_fees") if isinstance(metrics.get("total_fees"), (int, float)) else metrics.get("total_fees_paid")
+            max_dd_usd = metrics.get("max_drawdown")
+            max_dd_pct = metrics.get("max_drawdown_pct")
+            if not isinstance(max_dd_pct, (int, float)) and isinstance(max_dd_usd, (int, float)) and isinstance(start_balance, (int, float)) and float(start_balance) != 0.0:
+                max_dd_pct = (float(max_dd_usd) / float(start_balance)) * 100.0
+            verdict = metrics.get("verdict", strict_summary.get("verdict", "n/a"))
+            if isinstance(verdict, dict):
+                verdict = verdict.get("label", "n/a")
+            pf = metrics.get("profit_factor")
+            pf_text = "inf" if bool(metrics.get("profit_factor_is_infinite")) else (f"{float(pf):.4f}" if isinstance(pf, (int, float)) else "n/a")
 
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            eq = strict_plot[["trade_number", "balance_after_trade"]].dropna()
-            if eq.empty:
-                st.info("No equity data.")
-            else:
-                st.line_chart(eq, x="trade_number", y="balance_after_trade")
-        with p2:
-            dd = strict_plot[["trade_number", "drawdown"]].dropna()
-            if dd.empty:
-                st.info("No drawdown data.")
-            else:
-                st.line_chart(dd, x="trade_number", y="drawdown")
-        with p3:
-            fees = strict_plot[["trade_number", "fees_cum_usd"]].dropna()
-            if fees.empty:
-                st.info("No fees data.")
-            else:
-                st.line_chart(fees, x="trade_number", y="fees_cum_usd")
+            a1, a2, a3, a4, a5 = st.columns(5)
+            a6, a7, a8, a9, a10, a11 = st.columns(6)
+            a1.metric("Starting Balance", f"${float(start_balance):,.2f}" if isinstance(start_balance, (int, float)) else "n/a")
+            a2.metric("Final Balance ($)", f"${float(final_balance):,.2f}" if isinstance(final_balance, (int, float)) else "n/a")
+            a3.metric("Net Profit / Loss ($)", f"${float(net_pnl):,.2f}" if isinstance(net_pnl, (int, float)) else "n/a")
+            a4.metric("Return (%)", f"{float(return_pct):.2f}%" if isinstance(return_pct, (int, float)) else "n/a")
+            a5.metric("Total Fees Paid ($)", f"${float(total_fees):,.2f}" if isinstance(total_fees, (int, float)) else "n/a")
+            a6.metric(
+                "Max Drawdown ($ and %)",
+                (
+                    f"${float(max_dd_usd):,.2f} ({float(max_dd_pct):.2f}%)"
+                    if isinstance(max_dd_usd, (int, float)) and isinstance(max_dd_pct, (int, float))
+                    else "n/a"
+                ),
+            )
+            a7.metric("Profit Factor", pf_text)
+            a8.metric("Win Rate", f"{float(metrics.get('win_rate')):.2%}" if isinstance(metrics.get("win_rate"), (int, float)) else "n/a")
+            a9.metric("Average Net R", f"{float(metrics.get('average_r')):.4f}" if isinstance(metrics.get("average_r"), (int, float)) else "n/a")
+            a10.metric(
+                "Max Losing Streak",
+                f"{int(metrics.get('max_losing_streak')):,}" if isinstance(metrics.get("max_losing_streak"), (int, float)) else "n/a",
+            )
+            a11.metric("Pass / Fail Verdict", str(verdict))
 
-        latest_50 = strict_plot.sort_values("trade_number", ascending=False).head(50).copy()
-        latest_50 = latest_50.rename(
-            columns={
-                "trade_number": "trade #",
-                "gross_pnl": "gross_pnl_usd",
-                "execution_costs": "execution_cost_usd",
-                "net_pnl": "net_pnl_usd",
-                "balance_after_trade": "balance_after_usd",
-                "drawdown": "drawdown_usd",
-                "net_r": "r_value_net",
-            }
-        )
-        st.dataframe(
-            latest_50[
-                [
-                    "trade #",
-                    "entry_ts",
-                    "exit_ts",
-                    "side",
-                    "gross_pnl_usd",
-                    "execution_cost_usd",
-                    "net_pnl_usd",
-                    "balance_after_usd",
-                    "drawdown_usd",
-                    "r_value_net",
-                    "outcome",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+            strict_plot = strict_df.copy()
+            if "profile" in strict_plot.columns:
+                strict_plot = strict_plot[strict_plot["profile"].astype(str) == selected_profile].copy()
+            elif selected_profile != "extreme":
+                st.info("Selected profile trade rows are not present in CSV. Re-run strict_prop_simulation.py with per-profile CSV export.")
+                strict_plot = strict_plot.iloc[0:0].copy()
+            for c in ("trade_number", "gross_pnl", "execution_costs", "net_pnl", "balance_after_trade", "drawdown", "net_r"):
+                strict_plot[c] = pd.to_numeric(strict_plot[c], errors="coerce")
+            strict_plot = strict_plot.dropna(subset=["trade_number"]).sort_values("trade_number", ascending=True)
+            strict_plot["fees_cum_usd"] = strict_plot["execution_costs"].fillna(0.0).cumsum()
+
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                eq = strict_plot[["trade_number", "balance_after_trade"]].dropna()
+                if eq.empty:
+                    st.info("No equity data.")
+                else:
+                    st.line_chart(eq, x="trade_number", y="balance_after_trade")
+            with p2:
+                dd = strict_plot[["trade_number", "drawdown"]].dropna()
+                if dd.empty:
+                    st.info("No drawdown data.")
+                else:
+                    st.line_chart(dd, x="trade_number", y="drawdown")
+            with p3:
+                fees = strict_plot[["trade_number", "fees_cum_usd"]].dropna()
+                if fees.empty:
+                    st.info("No fees data.")
+                else:
+                    st.line_chart(fees, x="trade_number", y="fees_cum_usd")
+
+            latest_50 = strict_plot.sort_values("trade_number", ascending=False).head(50).copy()
+            latest_50 = latest_50.rename(
+                columns={
+                    "trade_number": "trade #",
+                    "gross_pnl": "gross_pnl_usd",
+                    "execution_costs": "execution_cost_usd",
+                    "net_pnl": "net_pnl_usd",
+                    "balance_after_trade": "balance_after_usd",
+                    "drawdown": "drawdown_usd",
+                    "net_r": "r_value_net",
+                }
+            )
+            st.dataframe(
+                latest_50[
+                    [
+                        "trade #",
+                        "entry_ts",
+                        "exit_ts",
+                        "side",
+                        "gross_pnl_usd",
+                        "execution_cost_usd",
+                        "net_pnl_usd",
+                        "balance_after_usd",
+                        "drawdown_usd",
+                        "r_value_net",
+                        "outcome",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     live_on = _pgrep_f("tjtb.live.live_paper_crypto")
     dash_on = _pgrep_f("streamlit run dashboard/app.py")
