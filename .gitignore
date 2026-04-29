@@ -12,3 +12,7 @@ tests/__pycache__/
 **/the_jewish_trading_bot.egg-info/
 .venv/
 venv/
+
+# Next.js dashboard (frontend/)
+frontend/node_modules/
+frontend/.next/

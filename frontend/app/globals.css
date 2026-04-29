@@ -1,0 +1,39 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #0f1419;
+  color: #e7e9ea;
+  padding: 1.5rem;
+}
+main {
+  max-width: 42rem;
+}
+h1 {
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+}
+dl {
+  margin: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+dt {
+  font-size: 0.75rem;
+  color: #8899a6;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+dd {
+  margin: 0;
+  font-size: 1rem;
+}
+.error {
+  color: #f4212e;
+}
+.loading {
+  color: #8899a6;
+}
