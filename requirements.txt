@@ -1,5 +1,3 @@
-streamlit
-pandas
-websockets
-fastapi
-uvicorn
+# Minimal deps for Vercel/Lambda read-only API (keep under ephemeral storage limits).
+fastapi>=0.110,<1
+uvicorn>=0.27,<1

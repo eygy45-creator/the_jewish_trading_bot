@@ -8,5 +8,7 @@ logs/
 *.joblib
 __pycache__/
 *.pyc
+tests/__pycache__/
+**/the_jewish_trading_bot.egg-info/
 .venv/
 venv/

@@ -1,0 +1,34 @@
+# Slim bundle for read-only FastAPI on Vercel (Lambda 500MB limit).
+# Only `tjtb.runtime_paths` + `tjtb.api.app` are needed at runtime.
+
+dashboard/
+deploy/
+scripts/
+tests/
+runs/
+reports/
+logs/
+data/
+
+src/tjtb/backtest/
+src/tjtb/config/
+src/tjtb/data/
+src/tjtb/execution/
+src/tjtb/features/
+src/tjtb/labels/
+src/tjtb/live/
+src/tjtb/models/
+src/tjtb/monitoring/
+src/tjtb/news/
+src/tjtb/paper/
+src/tjtb/reports/
+src/tjtb/risk/
+src/tjtb/schemas/
+src/tjtb/signals/
+src/tjtb/storage/
+src/tjtb/utils/
+
+**/__pycache__/
+**/*.pyc
+.venv/
+**/the_jewish_trading_bot.egg-info/

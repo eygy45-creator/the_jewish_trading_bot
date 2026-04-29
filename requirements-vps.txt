@@ -1,0 +1,6 @@
+# Full stack for VPS / local research + dashboard (heavy deps — do not use on Vercel).
+streamlit
+pandas
+websockets
+fastapi>=0.110,<1
+uvicorn>=0.27,<1
