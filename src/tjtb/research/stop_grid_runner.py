@@ -239,6 +239,7 @@ def run_stop_grid(
     data_source: str = "coinbase",
     raw_dir: Path = RAW_DATA_DIR,
     stops: list[float] | None = None,
+    symbol: str = "BTCUSDT",
 ) -> list[StopGridResult]:
     stop_vals = stops or DEFAULT_STOPS
     if any(s <= 0 for s in stop_vals):
@@ -250,9 +251,19 @@ def run_stop_grid(
 
     out: list[StopGridResult] = []
     for stop in stop_vals:
-        eng = StopGridEngine(LOGGER, data_source=data_source, stop_size=stop)
-        for obj in objs:
-            eng.process_object(obj)
+        import os
+
+        prev_symbol = os.environ.get("BYBIT_SYMBOL")
+        os.environ["BYBIT_SYMBOL"] = str(symbol).strip().upper()
+        try:
+            eng = StopGridEngine(LOGGER, data_source=data_source, stop_size=stop)
+            for obj in objs:
+                eng.process_object(obj)
+        finally:
+            if prev_symbol is None:
+                os.environ.pop("BYBIT_SYMBOL", None)
+            else:
+                os.environ["BYBIT_SYMBOL"] = prev_symbol
         closed = eng.closed_trades
         rs = [float(t["r_value"]) for t in closed]
         n = len(closed)
@@ -359,12 +370,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-source", choices=("coinbase", "bybit"), default="bybit")
     parser.add_argument("--stops", default="1,2,3,5,8,10,15,20")
     parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
+    parser.add_argument("--symbol", default="BTCUSDT", help="Bybit symbol for bybit source runs")
     parser.add_argument("--csv-output", type=Path, default=REPORTS_DIR / "stop_grid_results.csv")
     parser.add_argument("--json-output", type=Path, default=REPORTS_DIR / "stop_grid_summary.json")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     stops = [float(x.strip()) for x in str(args.stops).split(",") if x.strip()]
-    results = run_stop_grid(data_source=args.data_source, raw_dir=args.raw_dir, stops=stops)
+    results = run_stop_grid(
+        data_source=args.data_source,
+        raw_dir=args.raw_dir,
+        stops=stops,
+        symbol=str(args.symbol).strip().upper(),
+    )
     _write_reports(results, args.csv_output, args.json_output)
     LOGGER.info("wrote %s and %s (rows=%s)", args.csv_output, args.json_output, len(results))
     return 0

@@ -25,6 +25,7 @@ from statistics import mean
 from typing import Any
 
 from tjtb.exchanges.bybit.execution import BybitDemoExecution, ExecutionConfig
+from tjtb.exchanges.bybit.market_data import get_bybit_symbol, orderbook_topic, trade_topic
 from tjtb.features.build_features import parse_ts_to_unix
 from tjtb.runtime_paths import (
     HEARTBEAT_PATH,
@@ -329,6 +330,9 @@ class LivePaperEngine:
         ds = str(data_source).strip().lower()
         self.data_source = "bybit" if ds == "bybit" else "coinbase"
         self.exchange = "bybit" if self.data_source == "bybit" else "coinbase"
+        self.bybit_symbol = get_bybit_symbol()
+        self.bybit_orderbook_topic = orderbook_topic(self.bybit_symbol)
+        self.bybit_trade_topic = trade_topic(self.bybit_symbol)
         self.raw_glob = BYBIT_RAW_GLOB if self.data_source == "bybit" else RAW_GLOB
         self.reader = IncrementalNDJSON(self.raw_glob)
         self.started_at = _utc_now()
@@ -470,7 +474,7 @@ class LivePaperEngine:
         status = {
             "started_at": self.started_at,
             "last_update": _utc_now(),
-            "symbol": ("BTCUSDT" if self.data_source == "bybit" else "BTC-USD"),
+            "symbol": (self.bybit_symbol if self.data_source == "bybit" else "BTC-USD"),
             "data_source": self.data_source,
             "exchange": self.exchange,
             "execution_mode": self.execution_mode,
@@ -606,13 +610,15 @@ class LivePaperEngine:
         payload = obj.get("payload")
         if not isinstance(payload, dict):
             return
-        if str(payload.get("topic", "")) != "publicTrade.BTCUSDT":
+        if str(payload.get("topic", "")) != self.bybit_trade_topic:
             return
         trades = payload.get("data")
         if not isinstance(trades, list):
             return
         for tr in trades:
             if not isinstance(tr, dict):
+                continue
+            if str(tr.get("s", "")) != self.bybit_symbol:
                 continue
             t_ms = tr.get("T")
             try:
@@ -668,7 +674,7 @@ class LivePaperEngine:
         payload = obj.get("payload")
         if not isinstance(payload, dict):
             return None, 0.0
-        if str(payload.get("topic", "")) != "orderbook.50.BTCUSDT":
+        if str(payload.get("topic", "")) != self.bybit_orderbook_topic:
             return None, 0.0
         msg_type = str(payload.get("type", "")).lower()
         if msg_type not in {"snapshot", "delta"}:
@@ -676,7 +682,7 @@ class LivePaperEngine:
         data = payload.get("data")
         if not isinstance(data, dict):
             return None, 0.0
-        if str(data.get("s", "")) != "BTCUSDT":
+        if str(data.get("s", "")) != self.bybit_symbol:
             return None, 0.0
         ts_ms = payload.get("ts")
         try:

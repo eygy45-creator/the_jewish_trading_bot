@@ -2,20 +2,43 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
-ORDERBOOK_TOPIC = "orderbook.50.BTCUSDT"
-TRADE_TOPIC = "publicTrade.BTCUSDT"
+DEFAULT_SYMBOL = "BTCUSDT"
+
+
+def get_bybit_symbol(default: str = DEFAULT_SYMBOL) -> str:
+    return str(os.environ.get("BYBIT_SYMBOL", default)).strip().upper()
+
+
+def orderbook_topic(symbol: str) -> str:
+    return f"orderbook.50.{symbol}"
+
+
+def trade_topic(symbol: str) -> str:
+    return f"publicTrade.{symbol}"
+
+
+ORDERBOOK_TOPIC = orderbook_topic(DEFAULT_SYMBOL)
+TRADE_TOPIC = trade_topic(DEFAULT_SYMBOL)
 SUBSCRIBE_ARGS = [ORDERBOOK_TOPIC, TRADE_TOPIC]
 
 
-def is_public_data_topic(topic: str) -> bool:
-    return topic in {ORDERBOOK_TOPIC, TRADE_TOPIC}
+def build_subscribe_args(symbol: str | None = None) -> list[str]:
+    sym = (symbol or get_bybit_symbol()).upper()
+    return [orderbook_topic(sym), trade_topic(sym)]
 
 
-def parse_orderbook_message(msg: dict[str, Any]) -> dict[str, Any] | None:
+def is_public_data_topic(topic: str, symbol: str | None = None) -> bool:
+    sym = (symbol or get_bybit_symbol()).upper()
+    return topic in {orderbook_topic(sym), trade_topic(sym)}
+
+
+def parse_orderbook_message(msg: dict[str, Any], symbol: str | None = None) -> dict[str, Any] | None:
     """Return a minimal parsed orderbook payload or None if invalid."""
-    if str(msg.get("topic", "")) != ORDERBOOK_TOPIC:
+    sym = (symbol or get_bybit_symbol()).upper()
+    if str(msg.get("topic", "")) != orderbook_topic(sym):
         return None
     msg_type = str(msg.get("type", "")).lower()
     if msg_type not in {"snapshot", "delta"}:
@@ -23,15 +46,15 @@ def parse_orderbook_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     data = msg.get("data")
     if not isinstance(data, dict):
         return None
-    symbol = str(data.get("s", ""))
+    symbol_from_data = str(data.get("s", ""))
     bids = data.get("b")
     asks = data.get("a")
-    if symbol != "BTCUSDT" or not isinstance(bids, list) or not isinstance(asks, list):
+    if symbol_from_data != sym or not isinstance(bids, list) or not isinstance(asks, list):
         return None
     return {
         "kind": "orderbook",
         "type": msg_type,
-        "symbol": symbol,
+        "symbol": symbol_from_data,
         "bids": bids,
         "asks": asks,
         "u": data.get("u"),
@@ -41,9 +64,10 @@ def parse_orderbook_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def parse_trade_message(msg: dict[str, Any]) -> dict[str, Any] | None:
+def parse_trade_message(msg: dict[str, Any], symbol: str | None = None) -> dict[str, Any] | None:
     """Return a minimal parsed trade payload or None if invalid."""
-    if str(msg.get("topic", "")) != TRADE_TOPIC:
+    sym = (symbol or get_bybit_symbol()).upper()
+    if str(msg.get("topic", "")) != trade_topic(sym):
         return None
     data = msg.get("data")
     if not isinstance(data, list):
@@ -51,7 +75,7 @@ def parse_trade_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     if not data:
         return {
             "kind": "trades",
-            "symbol": "BTCUSDT",
+            "symbol": sym,
             "count": 0,
             "rows": [],
             "ts": msg.get("ts"),
@@ -60,8 +84,8 @@ def parse_trade_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     for row in data:
         if not isinstance(row, dict):
             continue
-        symbol = str(row.get("s", ""))
-        if symbol != "BTCUSDT":
+        symbol_from_row = str(row.get("s", ""))
+        if symbol_from_row != sym:
             continue
         side = str(row.get("S", ""))
         size = row.get("v")
@@ -70,7 +94,7 @@ def parse_trade_message(msg: dict[str, Any]) -> dict[str, Any] | None:
             continue
         rows.append(
             {
-                "symbol": symbol,
+                "symbol": symbol_from_row,
                 "side": side,
                 "size": size,
                 "price": price,
@@ -80,25 +104,26 @@ def parse_trade_message(msg: dict[str, Any]) -> dict[str, Any] | None:
         )
     return {
         "kind": "trades",
-        "symbol": "BTCUSDT",
+        "symbol": sym,
         "count": len(rows),
         "rows": rows,
         "ts": msg.get("ts"),
     }
 
 
-def normalize_public_message(msg: dict[str, Any], local_ts_iso: str) -> dict[str, Any] | None:
+def normalize_public_message(msg: dict[str, Any], local_ts_iso: str, symbol: str | None = None) -> dict[str, Any] | None:
     """
     Wrap a Bybit WS payload for NDJSON persistence.
 
     Raw payload is preserved under ``payload`` for fidelity.
     """
     topic = str(msg.get("topic", ""))
-    if not is_public_data_topic(topic):
+    sym = (symbol or get_bybit_symbol()).upper()
+    if not is_public_data_topic(topic, sym):
         return None
-    parsed = parse_orderbook_message(msg)
+    parsed = parse_orderbook_message(msg, sym)
     if parsed is None:
-        parsed = parse_trade_message(msg)
+        parsed = parse_trade_message(msg, sym)
     if parsed is None:
         return None
     return {

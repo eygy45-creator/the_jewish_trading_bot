@@ -90,3 +90,29 @@ def test_invalid_stop_values_rejected(tmp_path):
     with pytest.raises(ValueError):
         run_stop_grid(data_source="bybit", raw_dir=tmp_path, stops=[1.0, 0.0, 2.0])
 
+
+def test_stop_grid_supports_symbol_argument(tmp_path):
+    raw = tmp_path / "bybit_20260501.ndjson"
+    _write_ndjson(
+        raw,
+        [
+            {
+                "payload": {
+                    "topic": "orderbook.50.ETHUSDT",
+                    "type": "snapshot",
+                    "ts": 1700000000000,
+                    "data": {"s": "ETHUSDT", "b": [["3000", "2.0"]], "a": [["3000.5", "1.0"]]},
+                }
+            },
+            {
+                "payload": {
+                    "topic": "publicTrade.ETHUSDT",
+                    "ts": 1700000000100,
+                    "data": [{"T": 1700000000100, "S": "Sell", "s": "ETHUSDT", "v": "1.0", "p": "3000.2"}],
+                }
+            },
+        ],
+    )
+    res = run_stop_grid(data_source="bybit", raw_dir=tmp_path, stops=[1.0], symbol="ETHUSDT")
+    assert len(res) == 1
+

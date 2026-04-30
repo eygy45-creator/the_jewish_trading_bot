@@ -1,4 +1,4 @@
-"""Bybit public market-data recorder (linear BTCUSDT, no auth)."""
+"""Bybit public market-data recorder (linear symbol, no auth)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 
 import websockets
 
-from tjtb.exchanges.bybit.market_data import SUBSCRIBE_ARGS, normalize_public_message
+from tjtb.exchanges.bybit.market_data import build_subscribe_args, get_bybit_symbol, normalize_public_message
 from tjtb.runtime_paths import RAW_DATA_DIR, ensure_runtime_dirs
 
 DEFAULT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
@@ -37,12 +37,12 @@ def write_ndjson_line(path: Path, record: dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-async def subscribe_public_topics(ws: websockets.WebSocketClientProtocol) -> None:
-    req = {"op": "subscribe", "args": SUBSCRIBE_ARGS}
+async def subscribe_public_topics(ws: websockets.WebSocketClientProtocol, symbol: str) -> None:
+    req = {"op": "subscribe", "args": build_subscribe_args(symbol)}
     await ws.send(json.dumps(req))
 
 
-async def run_recorder(ws_url: str) -> None:
+async def run_recorder(ws_url: str, symbol: str) -> None:
     backoff = 1.0
     seen = 0
     while True:
@@ -54,8 +54,8 @@ async def run_recorder(ws_url: str) -> None:
                 ping_timeout=20,
                 max_size=20 * 1024 * 1024,
             ) as ws:
-                await subscribe_public_topics(ws)
-                log.info("subscribed args=%s", SUBSCRIBE_ARGS)
+                await subscribe_public_topics(ws, symbol)
+                log.info("subscribed symbol=%s args=%s", symbol, build_subscribe_args(symbol))
                 backoff = 1.0
                 while True:
                     raw_text = await asyncio.wait_for(ws.recv(), timeout=READ_TIMEOUT_SEC)
@@ -76,7 +76,7 @@ async def run_recorder(ws_url: str) -> None:
                         continue
                     if not isinstance(payload, dict):
                         continue
-                    rec = normalize_public_message(payload, local_ts)
+                    rec = normalize_public_message(payload, local_ts, symbol=symbol)
                     if rec is None:
                         continue
                     write_ndjson_line(out_path, rec)
@@ -98,13 +98,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Record Bybit public orderbook+trades to raw NDJSON")
     parser.add_argument("--ws-url", default=DEFAULT_WS_URL, help="Bybit public WS URL (linear category)")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--symbol", default=get_bybit_symbol(), help="Bybit symbol, e.g. BTCUSDT or ETHUSDT")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
     ensure_runtime_dirs()
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("output_dir=%s", RAW_DATA_DIR)
-    asyncio.run(run_recorder(args.ws_url))
+    symbol = str(args.symbol).strip().upper()
+    log.info("output_dir=%s symbol=%s", RAW_DATA_DIR, symbol)
+    asyncio.run(run_recorder(args.ws_url, symbol))
     return 0
 
 

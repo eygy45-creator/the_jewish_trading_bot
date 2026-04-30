@@ -110,3 +110,39 @@ def test_malformed_message_handling(tmp_path, monkeypatch):
     assert st.malformed_lines >= 1
     assert out_tr.is_file()
 
+
+def test_parser_accepts_ethusdt_topics(tmp_path, monkeypatch):
+    raw = tmp_path / "bybit_eth.ndjson"
+    out_tr = tmp_path / "trades.csv"
+    out_up = tmp_path / "updates.csv"
+    out_bs = tmp_path / "book_state.csv"
+    monkeypatch.setattr(pb, "OUTPUT_TRADES", out_tr)
+    monkeypatch.setattr(pb, "OUTPUT_BOOK_UPDATES", out_up)
+    monkeypatch.setattr(pb, "OUTPUT_BOOK_STATE", out_bs)
+    pb._init_csv_headers()
+
+    rows = [
+        {
+            "source": "bybit",
+            "payload": {
+                "topic": "orderbook.50.ETHUSDT",
+                "type": "snapshot",
+                "ts": 1700000000000,
+                "data": {"s": "ETHUSDT", "b": [["3000", "2.0"]], "a": [["3000.5", "1.0"]], "seq": 1},
+            },
+        },
+        {
+            "source": "bybit",
+            "payload": {
+                "topic": "publicTrade.ETHUSDT",
+                "type": "snapshot",
+                "ts": 1700000000100,
+                "data": [{"T": 1700000000100, "s": "ETHUSDT", "S": "Buy", "v": "0.3", "p": "3000.2", "seq": 2}],
+            },
+        },
+    ]
+    _write_lines(raw, rows)
+    st = pb.parse_file(str(raw), symbol="ETHUSDT")
+    assert st.book_updates_written >= 2
+    assert st.trades_written >= 1
+

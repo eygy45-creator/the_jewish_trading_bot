@@ -7,6 +7,7 @@ from tjtb.data.bybit_recorder import output_path_for_day, write_ndjson_line
 from tjtb.exchanges.bybit.market_data import (
     ORDERBOOK_TOPIC,
     TRADE_TOPIC,
+    build_subscribe_args,
     normalize_public_message,
     parse_orderbook_message,
     parse_trade_message,
@@ -77,4 +78,10 @@ def test_file_writing_smoke(tmp_path) -> None:
     loaded = json.loads(content)
     assert loaded["source"] == "bybit"
     assert loaded["topic"] == ORDERBOOK_TOPIC
+
+
+def test_recorder_topic_construction_for_ethusdt() -> None:
+    args = build_subscribe_args("ETHUSDT")
+    assert "orderbook.50.ETHUSDT" in args
+    assert "publicTrade.ETHUSDT" in args
 

@@ -26,6 +26,7 @@ OUTPUT_BOOK_STATE = Path("data/parsed/bybit_book_state.csv")
 READ_BUFFER = 1024 * 1024
 WRITE_BUFFER = 1024 * 1024
 SIZE_EPS = 1e-12
+DEFAULT_SYMBOL = "BTCUSDT"
 
 
 @dataclass
@@ -59,8 +60,8 @@ def _extract_payload(obj: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def parse_trade_rows(payload: dict[str, Any]) -> list[tuple[str, float, float, str, int | None]]:
-    if str(payload.get("topic", "")) != "publicTrade.BTCUSDT":
+def parse_trade_rows(payload: dict[str, Any], symbol: str = DEFAULT_SYMBOL) -> list[tuple[str, float, float, str, int | None]]:
+    if str(payload.get("topic", "")) != f"publicTrade.{symbol}":
         return []
     data = payload.get("data")
     if not isinstance(data, list):
@@ -85,17 +86,22 @@ def parse_trade_rows(payload: dict[str, Any]) -> list[tuple[str, float, float, s
     return out
 
 
-def parse_orderbook_levels(payload: dict[str, Any]) -> tuple[str, str, int, list[tuple[str, float, float]]]:
+def parse_orderbook_levels(
+    payload: dict[str, Any],
+    symbol: str = DEFAULT_SYMBOL,
+) -> tuple[str, str, int, list[tuple[str, float, float]]]:
     """
     Return (ts_iso, event_type, sequence_num, levels) where each level is (side, price, size).
     """
-    if str(payload.get("topic", "")) != "orderbook.50.BTCUSDT":
+    if str(payload.get("topic", "")) != f"orderbook.50.{symbol}":
         return "", "", 0, []
     msg_type = str(payload.get("type", "")).lower()
     if msg_type not in {"snapshot", "delta"}:
         return "", "", 0, []
     data = payload.get("data")
     if not isinstance(data, dict):
+        return "", "", 0, []
+    if str(data.get("s", "")) != symbol:
         return "", "", 0, []
     ts_iso = _iso_from_ms(payload.get("ts"))
     if ts_iso is None:
@@ -155,7 +161,7 @@ def _init_csv_headers() -> None:
         )
 
 
-def parse_file(input_path: str) -> ParseStats:
+def parse_file(input_path: str, symbol: str = DEFAULT_SYMBOL) -> ParseStats:
     stats = ParseStats()
     bids: dict[float, float] = {}
     asks: dict[float, float] = {}
@@ -185,12 +191,12 @@ def parse_file(input_path: str) -> ParseStats:
             if payload is None:
                 continue
 
-            trade_rows = parse_trade_rows(payload)
+            trade_rows = parse_trade_rows(payload, symbol=symbol)
             for row in trade_rows:
                 tw.writerow(row)
                 stats.trades_written += 1
 
-            ts_iso, ev_type, seq, levels = parse_orderbook_levels(payload)
+            ts_iso, ev_type, seq, levels = parse_orderbook_levels(payload, symbol=symbol)
             if not levels:
                 continue
             if ev_type == "snapshot":
@@ -235,15 +241,17 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
     p = argparse.ArgumentParser(description="Parse Bybit raw NDJSON into normalized CSVs")
     p.add_argument("--glob", default=DEFAULT_RAW_GLOB)
+    p.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Bybit symbol, e.g. BTCUSDT or ETHUSDT")
     args = p.parse_args(argv)
     paths = sorted(Path().glob(args.glob))
     if not paths:
         logger.error("No input files matching %s", args.glob)
         return
+    symbol = str(args.symbol).strip().upper()
     _init_csv_headers()
     total = ParseStats()
     for path in paths:
-        st = parse_file(str(path.resolve()))
+        st = parse_file(str(path.resolve()), symbol=symbol)
         total.trades_written += st.trades_written
         total.book_updates_written += st.book_updates_written
         total.snapshots_seen += st.snapshots_seen

@@ -51,8 +51,8 @@ def test_bybit_public_trade_increments_trade_times(tmp_path, monkeypatch):
         "payload": {
             "topic": "publicTrade.BTCUSDT",
             "data": [
-                {"T": 1700000000100, "S": "Buy", "v": "0.01", "p": "100.2"},
-                {"T": 1700000000200, "S": "Sell", "v": "0.02", "p": "100.1"},
+                {"T": 1700000000100, "s": "BTCUSDT", "S": "Buy", "v": "0.01", "p": "100.2"},
+                {"T": 1700000000200, "s": "BTCUSDT", "S": "Sell", "v": "0.02", "p": "100.1"},
             ],
         }
     }
@@ -175,4 +175,53 @@ def test_existing_csv_required_headers_unchanged(tmp_path, monkeypatch):
     opp_header = (tmp_path / "opportunities.csv").read_text(encoding="utf-8").splitlines()[0]
     assert trade_header == "entry_ts,exit_ts,side,entry_price,exit_price,outcome,r_value,regime"
     assert opp_header == "ts,anomaly_percentile,anomaly_score,direction,regime,action,reason"
+
+
+def test_live_bybit_filters_and_processes_ethusdt(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.setenv("BYBIT_SYMBOL", "ETHUSDT")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+
+    # BTC event should be ignored
+    top_btc, _ = eng._process_l2_msg(
+        {
+            "payload": {
+                "topic": "orderbook.50.BTCUSDT",
+                "type": "snapshot",
+                "ts": 1700000000000,
+                "data": {"s": "BTCUSDT", "b": [["100", "1"]], "a": [["101", "1"]]},
+            }
+        }
+    )
+    assert top_btc is None
+
+    # ETH event should be accepted
+    top_eth, _ = eng._process_l2_msg(
+        {
+            "payload": {
+                "topic": "orderbook.50.ETHUSDT",
+                "type": "snapshot",
+                "ts": 1700000001000,
+                "data": {"s": "ETHUSDT", "b": [["3000", "2"]], "a": [["3000.5", "1"]]},
+            }
+        }
+    )
+    assert top_eth is not None
+    assert top_eth.best_bid == 3000.0
+
+
+def test_dry_run_sizing_works_with_ethusdt(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.setenv("BYBIT_SYMBOL", "ETHUSDT")
+    monkeypatch.setenv("EXECUTION_MODE", "bybit_demo_dry_run")
+    monkeypatch.setenv("KILL_SWITCH", "false")
+    monkeypatch.setenv("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", "true")
+    monkeypatch.setenv("BYBIT_BALANCE_OVERRIDE", "10000")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+    ok, _ = eng._plan_bybit_dry_run_entry(_mk_top(), tp_r=2.0)
+    assert ok is True
+    assert eng.last_execution_plan is not None
+    assert eng.last_execution_plan["symbol"] == "ETHUSDT"
 
