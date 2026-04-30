@@ -49,11 +49,12 @@ class ExecutionConfig:
 
 
 def validate_execution_guards(cfg: ExecutionConfig) -> tuple[bool, str | None]:
-    if cfg.execution_mode != "bybit_demo":
+    if cfg.execution_mode not in {"bybit_demo", "bybit_demo_dry_run"}:
         return False, "execution_mode_not_bybit_demo"
-    if not cfg.bybit_testnet:
+    if cfg.execution_mode == "bybit_demo" and not cfg.bybit_testnet:
         return False, "bybit_testnet_not_true"
-    if cfg.kill_switch:
+    allow_dry_with_kill = _env_bool("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", default=False)
+    if cfg.kill_switch and not (cfg.execution_mode == "bybit_demo_dry_run" and allow_dry_with_kill):
         return False, "kill_switch_active"
     return True, None
 
@@ -72,6 +73,8 @@ class BybitDemoExecution:
 
     def _load_credentials_if_needed(self) -> None:
         # Must fail only when execution is attempted.
+        if self.config.execution_mode == "bybit_demo_dry_run":
+            return
         BybitClient.load_credentials_from_env()
 
     def build_entry_short(

@@ -24,6 +24,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from tjtb.exchanges.bybit.execution import BybitDemoExecution, ExecutionConfig
 from tjtb.features.build_features import parse_ts_to_unix
 from tjtb.runtime_paths import (
     HEARTBEAT_PATH,
@@ -48,6 +49,21 @@ OPPORTUNITIES_HEADER = [
     "direction",
     "regime",
     "action",
+    "reason",
+]
+EXECUTION_DRY_RUN_HEADER = [
+    "ts",
+    "data_source",
+    "execution_mode",
+    "symbol",
+    "entry_price",
+    "stop_price",
+    "tp_price",
+    "qty",
+    "risk_usd",
+    "notional",
+    "leverage",
+    "ok",
     "reason",
 ]
 
@@ -355,6 +371,12 @@ class LivePaperEngine:
         self.max_losing_streak = 0
         self._curr_losing_streak = 0
         self.opportunities_appended = 0
+        self.execution_mode = str(os.environ.get("EXECUTION_MODE", "paper")).strip().lower()
+        self.execution_dry_run_path = PAPER_TRADES_PATH.parent / "execution_dry_run.csv"
+        self.last_execution_plan: dict[str, Any] | None = None
+        self._bybit_execution: BybitDemoExecution | None = None
+        if self.execution_mode == "bybit_demo_dry_run":
+            self._bybit_execution = BybitDemoExecution(config=ExecutionConfig.from_env())
 
         _ensure_opportunities_csv_schema(OPPORTUNITIES_PATH)
         _write_csv_header(
@@ -370,6 +392,7 @@ class LivePaperEngine:
                 "regime",
             ],
         )
+        _write_csv_header(self.execution_dry_run_path, EXECUTION_DRY_RUN_HEADER)
 
     def _expire_windows(self, ts: float) -> None:
         lo = ts - LOOKBACK_SEC
@@ -450,6 +473,7 @@ class LivePaperEngine:
             "symbol": ("BTCUSDT" if self.data_source == "bybit" else "BTC-USD"),
             "data_source": self.data_source,
             "exchange": self.exchange,
+            "execution_mode": self.execution_mode,
             "raw_events_seen": self.raw_events_seen,
             "current_mid_price": current_mid,
             "current_regime": current_regime,
@@ -466,6 +490,7 @@ class LivePaperEngine:
             "max_drawdown_r": mdd,
             "max_losing_streak": self.max_losing_streak,
             "last_10_trades": last10,
+            "last_execution_plan": self.last_execution_plan,
         }
         REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
         REPORT_PATH.write_text(json.dumps(status, indent=2, allow_nan=False), encoding="utf-8")
@@ -736,6 +761,77 @@ class LivePaperEngine:
         self.daily_counts[d] = self.daily_counts.get(d, 0) + 1
         self.session_counts[s] = self.session_counts.get(s, 0) + 1
 
+    def _plan_bybit_dry_run_entry(self, top: TopState, tp_r: float) -> tuple[bool, str]:
+        if self.execution_mode != "bybit_demo_dry_run":
+            self.last_execution_plan = None
+            return True, ""
+        if self.data_source != "bybit":
+            self.last_execution_plan = None
+            return True, ""
+        if self._bybit_execution is None:
+            self.last_execution_plan = None
+            return True, ""
+
+        stop_price = top.mid + 1.0
+        tp_price = top.mid - tp_r
+        balance_override = str(os.environ.get("BYBIT_BALANCE_OVERRIDE", "")).strip()
+        try:
+            account_balance = float(balance_override) if balance_override else self._bybit_execution.client.get_account_balance()
+        except ValueError:
+            account_balance = 0.0
+
+        try:
+            res = self._bybit_execution.build_entry_short(
+                account_balance=account_balance,
+                entry_price=top.mid,
+                stop_price=stop_price,
+            )
+        except RuntimeError as exc:
+            res = {"ok": False, "reject_reason": str(exc), "sizing": None}
+        ok = bool(res.get("ok"))
+        reason = "" if ok else str(res.get("reject_reason", "execution_dry_run_rejected"))
+
+        sizing = res.get("sizing")
+        qty = float(getattr(sizing, "qty", 0.0)) if sizing is not None else 0.0
+        risk_usd = float(getattr(sizing, "risk_usd", 0.0)) if sizing is not None else 0.0
+        notional = float(getattr(sizing, "notional", 0.0)) if sizing is not None else 0.0
+        leverage = float(getattr(sizing, "leverage", 1.0)) if sizing is not None else 1.0
+        self.last_execution_plan = {
+            "ok": ok,
+            "reason": reason,
+            "symbol": self._bybit_execution.config.bybit_symbol,
+            "entry_price": top.mid,
+            "stop_price": stop_price,
+            "tp_price": tp_price,
+            "qty": qty,
+            "risk_usd": risk_usd,
+            "notional": notional,
+            "leverage": leverage,
+            "payloads": {
+                "set_leverage": res.get("set_leverage"),
+                "entry_order": res.get("entry_order"),
+            },
+        }
+        _append_csv(
+            self.execution_dry_run_path,
+            [
+                top.ts_text,
+                self.data_source,
+                self.execution_mode,
+                self._bybit_execution.config.bybit_symbol,
+                top.mid,
+                stop_price,
+                tp_price,
+                qty,
+                risk_usd,
+                notional,
+                leverage,
+                ok,
+                reason,
+            ],
+        )
+        return ok, reason
+
     def loop_once(self) -> None:
         objs = self.reader.read_new_objects()
         if not objs:
@@ -805,11 +901,16 @@ class LivePaperEngine:
                 action = "blocked"
                 if can and self.open_trade is None:
                     tp_r, be_trigger = self._regime_params(current_regime)
-                    self._take_trade(top, current_regime, tp_r, be_trigger)
-                    self.last_signal_ts = top.ts
-                    action = "entered_short"
-                    reason = ""
-                else:
+                    ok_exec, exec_reason = self._plan_bybit_dry_run_entry(top, tp_r)
+                    if ok_exec:
+                        self._take_trade(top, current_regime, tp_r, be_trigger)
+                        self.last_signal_ts = top.ts
+                        action = "entered_short"
+                        reason = ""
+                    else:
+                        action = "blocked"
+                        reason = exec_reason
+                if action == "blocked" and reason:
                     self.trades_blocked += 1
                     self.trades_blocked_by_reason[reason] = self.trades_blocked_by_reason.get(reason, 0) + 1
                 _append_opportunity_row(

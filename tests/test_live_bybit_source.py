@@ -77,3 +77,102 @@ def test_malformed_bybit_messages_are_skipped_safely(tmp_path, monkeypatch):
     assert pressure == 0.0
     assert len(eng.trade_times) == 0
 
+
+def _mk_top() -> live.TopState:
+    return live.TopState(
+        ts=1700000000.0,
+        ts_text="2023-11-14T22:13:20+00:00",
+        best_bid=100.0,
+        best_ask=100.5,
+        best_bid_sz=2.0,
+        best_ask_sz=1.0,
+        spread=0.5,
+        mid=100.25,
+        micro_dev=0.1,
+        tob_imb=0.333333,
+    )
+
+
+def test_dry_run_computes_qty_from_risk_fraction(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.setenv("DATA_SOURCE", "bybit")
+    monkeypatch.setenv("EXECUTION_MODE", "bybit_demo_dry_run")
+    monkeypatch.setenv("BYBIT_SYMBOL", "BTCUSDT")
+    monkeypatch.setenv("RISK_PER_TRADE", "0.0025")
+    monkeypatch.setenv("KILL_SWITCH", "false")
+    monkeypatch.setenv("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", "true")
+    monkeypatch.setenv("BYBIT_BALANCE_OVERRIDE", "10000")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+    ok, reason = eng._plan_bybit_dry_run_entry(_mk_top(), tp_r=2.0)
+    assert ok is True
+    assert reason == ""
+    # risk=25, stop distance=1.0 => qty=25
+    assert eng.last_execution_plan is not None
+    assert abs(float(eng.last_execution_plan["qty"]) - 25.0) < 1e-9
+
+
+def test_dry_run_rejects_invalid_sizing(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.setenv("EXECUTION_MODE", "bybit_demo_dry_run")
+    monkeypatch.setenv("KILL_SWITCH", "false")
+    monkeypatch.setenv("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", "true")
+    monkeypatch.setenv("BYBIT_BALANCE_OVERRIDE", "0")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+    ok, reason = eng._plan_bybit_dry_run_entry(_mk_top(), tp_r=2.0)
+    assert ok is False
+    assert reason == "invalid_account_balance"
+
+
+def test_dry_run_requires_no_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+    monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
+    monkeypatch.setenv("EXECUTION_MODE", "bybit_demo_dry_run")
+    monkeypatch.setenv("KILL_SWITCH", "false")
+    monkeypatch.setenv("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", "true")
+    monkeypatch.setenv("BYBIT_BALANCE_OVERRIDE", "10000")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+    ok, _ = eng._plan_bybit_dry_run_entry(_mk_top(), tp_r=2.0)
+    assert ok is True
+
+
+def test_dry_run_writes_additive_execution_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.setenv("EXECUTION_MODE", "bybit_demo_dry_run")
+    monkeypatch.setenv("KILL_SWITCH", "false")
+    monkeypatch.setenv("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", "true")
+    monkeypatch.setenv("BYBIT_BALANCE_OVERRIDE", "10000")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+    ok, _ = eng._plan_bybit_dry_run_entry(_mk_top(), tp_r=2.0)
+    assert ok is True
+    assert eng.execution_dry_run_path.is_file()
+    lines = eng.execution_dry_run_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 2
+
+
+def test_dry_run_respects_kill_switch_without_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    monkeypatch.setenv("EXECUTION_MODE", "bybit_demo_dry_run")
+    monkeypatch.setenv("KILL_SWITCH", "true")
+    monkeypatch.delenv("BYBIT_DRY_RUN_ALLOW_KILL_SWITCH", raising=False)
+    monkeypatch.setenv("BYBIT_BALANCE_OVERRIDE", "10000")
+    eng = live.LivePaperEngine(_test_logger(), data_source="bybit")
+    ok, reason = eng._plan_bybit_dry_run_entry(_mk_top(), tp_r=2.0)
+    assert ok is False
+    assert reason == "kill_switch_active"
+
+
+def test_existing_csv_required_headers_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "PAPER_TRADES_PATH", tmp_path / "paper_trades.csv")
+    monkeypatch.setattr(live, "OPPORTUNITIES_PATH", tmp_path / "opportunities.csv")
+    live.LivePaperEngine(_test_logger(), data_source="coinbase")
+    trade_header = (tmp_path / "paper_trades.csv").read_text(encoding="utf-8").splitlines()[0]
+    opp_header = (tmp_path / "opportunities.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert trade_header == "entry_ts,exit_ts,side,entry_price,exit_price,outcome,r_value,regime"
+    assert opp_header == "ts,anomaly_percentile,anomaly_score,direction,regime,action,reason"
+
