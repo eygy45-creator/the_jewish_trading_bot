@@ -37,6 +37,7 @@ from tjtb.runtime_paths import (
 )
 
 RAW_GLOB = "coinbase_*.ndjson"
+BYBIT_RAW_GLOB = "bybit_*.ndjson"
 REPORT_PATH = REPORTS_DIR / "live_status.json"
 LOG_PATH = LIVE_BOT_LOG_PATH
 LOCK_PATH = LOGS_DIR / "tjtb-live.lock"
@@ -258,13 +259,14 @@ class PercentileRank:
 
 
 class IncrementalNDJSON:
-    def __init__(self) -> None:
+    def __init__(self, raw_glob: str) -> None:
+        self.raw_glob = raw_glob
         self.file_path: Path | None = None
         self.offset = 0
         self.partial = ""
 
     def _latest_file(self) -> Path | None:
-        files = [p for p in RAW_DATA_DIR.glob(RAW_GLOB) if p.is_file()]
+        files = [p for p in RAW_DATA_DIR.glob(self.raw_glob) if p.is_file()]
         if not files:
             return None
         files.sort(key=lambda p: p.stat().st_mtime)
@@ -306,9 +308,13 @@ class IncrementalNDJSON:
 
 
 class LivePaperEngine:
-    def __init__(self, logger: logging.Logger) -> None:
+    def __init__(self, logger: logging.Logger, data_source: str = "coinbase") -> None:
         self.log = logger
-        self.reader = IncrementalNDJSON()
+        ds = str(data_source).strip().lower()
+        self.data_source = "bybit" if ds == "bybit" else "coinbase"
+        self.exchange = "bybit" if self.data_source == "bybit" else "coinbase"
+        self.raw_glob = BYBIT_RAW_GLOB if self.data_source == "bybit" else RAW_GLOB
+        self.reader = IncrementalNDJSON(self.raw_glob)
         self.started_at = _utc_now()
 
         self.bids: dict[float, float] = {}
@@ -441,7 +447,9 @@ class LivePaperEngine:
         status = {
             "started_at": self.started_at,
             "last_update": _utc_now(),
-            "symbol": "BTC-USD",
+            "symbol": ("BTCUSDT" if self.data_source == "bybit" else "BTC-USD"),
+            "data_source": self.data_source,
+            "exchange": self.exchange,
             "raw_events_seen": self.raw_events_seen,
             "current_mid_price": current_mid,
             "current_regime": current_regime,
@@ -463,7 +471,7 @@ class LivePaperEngine:
         REPORT_PATH.write_text(json.dumps(status, indent=2, allow_nan=False), encoding="utf-8")
 
     def feed_status(self) -> tuple[str, str | None, int, float | None]:
-        files = [p for p in RAW_DATA_DIR.glob(RAW_GLOB) if p.is_file()]
+        files = [p for p in RAW_DATA_DIR.glob(self.raw_glob) if p.is_file()]
         if not files:
             return "NO_FEED", None, 0, None
         latest = max(files, key=lambda p: p.stat().st_mtime)
@@ -553,6 +561,9 @@ class LivePaperEngine:
             self._close_trade(top.ts_text, top.mid, "timeout", r)
 
     def _process_trade_msg(self, obj: dict[str, Any]) -> None:
+        if self.data_source == "bybit":
+            self._process_trade_msg_bybit(obj)
+            return
         if obj.get("channel") != "market_trades":
             return
         for ev in obj.get("events", []) if isinstance(obj.get("events"), list) else []:
@@ -566,7 +577,28 @@ class LivePaperEngine:
                     continue
                 self.trade_times.append(t)
 
+    def _process_trade_msg_bybit(self, obj: dict[str, Any]) -> None:
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("topic", "")) != "publicTrade.BTCUSDT":
+            return
+        trades = payload.get("data")
+        if not isinstance(trades, list):
+            return
+        for tr in trades:
+            if not isinstance(tr, dict):
+                continue
+            t_ms = tr.get("T")
+            try:
+                t = float(int(t_ms)) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            self.trade_times.append(t)
+
     def _process_l2_msg(self, obj: dict[str, Any]) -> tuple[TopState | None, float]:
+        if self.data_source == "bybit":
+            return self._process_l2_msg_bybit(obj)
         if obj.get("channel") != "l2_data":
             return None, 0.0
         pressure = 0.0
@@ -605,6 +637,69 @@ class LivePaperEngine:
                 top = self._top_from_book(ts, ts_text)
                 if top is not None:
                     self.last_top = top
+        return self.last_top, pressure
+
+    def _process_l2_msg_bybit(self, obj: dict[str, Any]) -> tuple[TopState | None, float]:
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            return None, 0.0
+        if str(payload.get("topic", "")) != "orderbook.50.BTCUSDT":
+            return None, 0.0
+        msg_type = str(payload.get("type", "")).lower()
+        if msg_type not in {"snapshot", "delta"}:
+            return None, 0.0
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None, 0.0
+        if str(data.get("s", "")) != "BTCUSDT":
+            return None, 0.0
+        ts_ms = payload.get("ts")
+        try:
+            ts = float(int(ts_ms)) / 1000.0
+        except (TypeError, ValueError):
+            return None, 0.0
+        ts_text = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+        if msg_type == "snapshot":
+            self.bids.clear()
+            self.asks.clear()
+
+        pressure = 0.0
+        for lv in data.get("b", []) if isinstance(data.get("b"), list) else []:
+            if not isinstance(lv, list) or len(lv) < 2:
+                continue
+            px = _safe_float(lv[0])
+            nq = _safe_float(lv[1])
+            if px is None or nq is None:
+                continue
+            self.l2_times.append(ts)
+            old = self.bids.get(px, 0.0)
+            delta = nq - old
+            pressure += delta
+            if nq <= 0:
+                self.bids.pop(px, None)
+            else:
+                self.bids[px] = nq
+
+        for lv in data.get("a", []) if isinstance(data.get("a"), list) else []:
+            if not isinstance(lv, list) or len(lv) < 2:
+                continue
+            px = _safe_float(lv[0])
+            nq = _safe_float(lv[1])
+            if px is None or nq is None:
+                continue
+            self.l2_times.append(ts)
+            old = self.asks.get(px, 0.0)
+            delta = nq - old
+            pressure += -delta
+            if nq <= 0:
+                self.asks.pop(px, None)
+            else:
+                self.asks[px] = nq
+
+        top = self._top_from_book(ts, ts_text)
+        if top is not None:
+            self.last_top = top
         return self.last_top, pressure
 
     def _can_take_trade(self, ts: float, regime: str) -> tuple[bool, str]:
@@ -747,7 +842,7 @@ def _log_periodic_diagnostic(logger: logging.Logger, engine: LivePaperEngine) ->
     if state == "NO_FEED":
         logger.warning(
             "NO LIVE DATA FEED DETECTED — no %s files under %s (start the NDJSON recorder writing here).",
-            RAW_GLOB,
+            engine.raw_glob,
             RAW_DATA_DIR,
         )
     elif state == "STALE":
@@ -793,6 +888,12 @@ def main(argv: list[str] | None = None) -> int:
         default=float(os.environ.get("TJTB_DIAG_INTERVAL_SEC", "30")),
         help="Periodic DIAGNOSTIC log interval (feed, counts, idle reason).",
     )
+    parser.add_argument(
+        "--data-source",
+        choices=("coinbase", "bybit"),
+        default=str(os.environ.get("DATA_SOURCE", "coinbase")).strip().lower(),
+        help="Raw feed source: coinbase (default) or bybit",
+    )
     args = parser.parse_args(argv)
 
     logger = _setup_logger()
@@ -813,8 +914,8 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
 
-    engine = LivePaperEngine(logger)
-    logger.info("live paper loop started (pid=%s)", os.getpid())
+    engine = LivePaperEngine(logger, data_source=args.data_source)
+    logger.info("live paper loop started (pid=%s data_source=%s)", os.getpid(), engine.data_source)
     diag_interval = max(args.diag_interval_sec, 5.0)
     last_diag = time.monotonic()
     _log_periodic_diagnostic(logger, engine)
