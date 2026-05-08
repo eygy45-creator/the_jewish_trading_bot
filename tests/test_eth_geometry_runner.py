@@ -9,6 +9,7 @@ import pytest
 import tjtb.live.live_paper_crypto as live
 from tjtb.live.live_paper_crypto import LivePaperEngine
 from tjtb.research.eth_geometry_runner import (
+    DEFAULT_TIMEOUTS_SEC,
     EthGeometryResult,
     ROUND_TRIP_TAKER_FEE,
     _average_fee_cost_r,
@@ -75,6 +76,18 @@ def test_eth_geometry_output_files(tmp_path):
     assert "best_by_raw_expectancy" in summary
     assert "best_by_survivability" in summary
     assert "best_realistic_execution_candidate" in summary
+
+
+def test_default_timeout_grid_includes_long_windows():
+    assert DEFAULT_TIMEOUTS_SEC == [2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 90.0, 120.0]
+
+
+def test_default_timeout_grid_is_used_by_runner(tmp_path):
+    raw = tmp_path / "bybit_20260501.ndjson"
+    _write_ndjson(raw, _sample_eth_rows())
+    res = run_eth_geometry_grid(data_source="bybit", raw_dir=tmp_path, stops=[1.0], symbol="ETHUSDT")
+    assert len(res) == len(DEFAULT_TIMEOUTS_SEC)
+    assert sorted({r.timeout_sec for r in res}) == DEFAULT_TIMEOUTS_SEC
 
 
 def test_leverage_math_sanity_eth():
