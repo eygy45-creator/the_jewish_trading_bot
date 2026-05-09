@@ -14,10 +14,16 @@ from tjtb.research.eth_geometry_runner import (
     EthGeometryEngine,
     ExcursionState,
     ROUND_TRIP_TAKER_FEE,
+    _anomaly_percentile_bucket,
     _average_fee_cost_r,
+    _build_regime_attribution,
+    _cohort_for_trade,
+    _dedupe_signal_level,
     _excursion_metrics,
+    _entry_session_label,
     _per_trade_net_r,
     _percentile,
+    _summarize_attribution_group,
     run_eth_geometry_grid,
     write_eth_geometry_reports,
 )
@@ -203,6 +209,170 @@ def test_excursion_null_values_when_targets_never_reached():
     assert out["time_to_first_0_25R"] is None
     assert out["time_to_first_0_5R"] is None
     assert out["time_to_first_2R"] is None
+
+
+def test_regime_attribution_cohort_assignment():
+    assert _cohort_for_trade({"mfe_r": 0.8, "mae_r": -0.2, "time_to_first_0_5R": 120.0}) == "tier_a_fast_clean_winner"
+    assert _cohort_for_trade({"mfe_r": 1.2, "mae_r": -0.8, "time_to_first_0_5R": 300.0}) == "tier_b_slow_noisy_winner"
+    assert _cohort_for_trade({"mfe_r": 0.4, "mae_r": -0.1, "time_to_first_0_5R": None}) == "tier_c_dead_signal"
+    assert _cohort_for_trade({"mfe_r": 0.6, "mae_r": -0.1, "time_to_first_0_5R": 200.0}) == "uncategorized_middle"
+
+
+def test_regime_attribution_by_variant_aggregation():
+    trades = [
+        {"mfe_r": 0.8, "mae_r": -0.2, "time_to_first_0_5R": 120.0},
+        {"mfe_r": 1.2, "mae_r": -0.8, "time_to_first_0_5R": 300.0},
+        {"mfe_r": 0.4, "mae_r": -0.1, "time_to_first_0_5R": None},
+    ]
+    summary = _summarize_attribution_group(trades)
+    assert summary["trade_count"] == 3
+    assert summary["tier_a_count"] == 1
+    assert summary["tier_b_count"] == 1
+    assert summary["tier_c_count"] == 1
+    assert summary["tier_a_rate"] == pytest.approx(1 / 3)
+    assert summary["median_mfe"] == pytest.approx(0.8)
+    assert summary["p75_mfe"] == pytest.approx(1.0)
+
+
+def test_signal_level_deduplication_prefers_longest_timeout_then_mfe():
+    trades = [
+        {"entry_signal_key": "sig1", "stop_size": 1.0, "timeout_sec": 120.0, "mfe_price_move": 1.0, "mfe_r": 1.0, "mae_r": -0.2, "time_to_first_0_5R": 30.0},
+        {"entry_signal_key": "sig1", "stop_size": 2.0, "timeout_sec": 900.0, "mfe_price_move": 0.8, "mfe_r": 0.4, "mae_r": -0.1, "time_to_first_0_5R": None},
+        {"entry_signal_key": "sig1", "stop_size": 1.0, "timeout_sec": 900.0, "mfe_price_move": 2.0, "mfe_r": 2.0, "mae_r": -0.2, "time_to_first_0_5R": 20.0},
+        {"entry_signal_key": "sig2", "stop_size": 1.0, "timeout_sec": 120.0, "mfe_price_move": 0.1, "mfe_r": 0.1, "mae_r": -0.2, "time_to_first_0_5R": None},
+    ]
+    deduped = sorted(_dedupe_signal_level(trades), key=lambda x: x["entry_signal_key"])
+    assert len(deduped) == 2
+    assert deduped[0]["entry_signal_key"] == "sig1"
+    assert deduped[0]["timeout_sec"] == 900.0
+    assert deduped[0]["mfe_price_move"] == pytest.approx(2.0)
+    assert deduped[0]["variants_seen"] == 4
+
+
+def test_anomaly_percentile_bucket_grouping():
+    assert _anomaly_percentile_bucket(0.9901) == "99.0-99.5"
+    assert _anomaly_percentile_bucket(0.996) == "99.5-99.9"
+    assert _anomaly_percentile_bucket(0.999) == "99.9+"
+    assert _anomaly_percentile_bucket(None) == "unknown"
+
+
+def test_entry_session_classification():
+    assert _entry_session_label(0) == "asia"
+    assert _entry_session_label(7 * 3600) == "london"
+    assert _entry_session_label(13 * 3600) == "london_ny_overlap"
+    assert _entry_session_label(17 * 3600) == "new_york"
+    assert _entry_session_label(22 * 3600) == "off_hours"
+
+
+def test_clustering_detection_counts_prior_only():
+    eng = EthGeometryEngine(logging.getLogger("tjtb.test.cluster"), data_source="bybit", stop_size=1.0, timeout_sec=900.0)
+    eng._qualifying_signal_times.extend([100.0, 170.0, 210.0])
+    counts = eng._prior_cluster_counts(220.0)
+    assert counts["prior_qualifying_anomalies_30s"] == 1
+    assert counts["prior_qualifying_anomalies_60s"] == 2
+    assert counts["prior_qualifying_anomalies_120s"] == 3
+
+
+def test_pre_entry_feature_capture_contains_only_current_and_prior_data():
+    eng = EthGeometryEngine(logging.getLogger("tjtb.test.features"), data_source="bybit", stop_size=1.0, timeout_sec=900.0)
+    top = _top(220.0, 100.0)
+    counts = {"prior_qualifying_anomalies_30s": 1, "prior_qualifying_anomalies_60s": 2, "prior_qualifying_anomalies_120s": 3}
+    features = eng._entry_features(
+        top=top,
+        pressure=-5.0,
+        event_rate=3.0,
+        trade_count=4.0,
+        mid_vol=0.2,
+        z_tob=-2.0,
+        z_micro=-1.5,
+        z_pressure=-2.5,
+        z_event=1.2,
+        z_trade=0.3,
+        z_spread=0.1,
+        z_mid_vol=0.4,
+        anomaly_score=2.5,
+        anomaly_percentile=0.999,
+        direction="bearish",
+        regime="volatile",
+        cluster_counts=counts,
+    )
+    assert features["entry_anomaly_percentile"] == pytest.approx(0.999)
+    assert features["entry_anomaly_score"] == pytest.approx(2.5)
+    assert features["entry_signed_book_pressure"] == pytest.approx(-5.0)
+    assert features["entry_z_pressure"] == pytest.approx(-2.5)
+    assert features["prior_qualifying_anomalies_120s"] == 3
+    assert features["is_repeated_signal_30s"] is True
+    assert "mfe_r" not in features
+    assert "exit_price" not in features
+
+
+def test_regime_attribution_summary_sections_present():
+    result = EthGeometryResult(
+        stop_size=1.0,
+        timeout_sec=120.0,
+        total_trades=2,
+        win_rate=0.5,
+        tp_rate=0.0,
+        timeout_rate=1.0,
+        average_r=0.0,
+        total_realized_r=0.0,
+        max_drawdown_r=0.0,
+        max_losing_streak=0,
+        profit_factor_net=0.0,
+        average_trade_duration_sec=120.0,
+        average_notional_required=0.0,
+        leverage_required_5k=0.0,
+        leverage_required_10k=0.0,
+        leverage_required_50k=0.0,
+        round_trip_fee_rate=ROUND_TRIP_TAKER_FEE,
+        average_round_trip_fee_usd=0.0,
+        average_fee_cost_r=0.0,
+        net_average_r_after_fees=0.0,
+        net_total_r_after_fees=0.0,
+        trades=[
+            {
+                "entry_signal_key": "a",
+                "regime": "volatile",
+                "entry_session": "new_york",
+                "entry_anomaly_percentile": 0.999,
+                "mfe_r": 0.8,
+                "mae_r": -0.2,
+                "time_to_first_0_5R": 100.0,
+                "mfe_price_move": 0.8,
+                "stop_size": 1.0,
+                "timeout_sec": 120.0,
+                "prior_qualifying_anomalies_120s": 1,
+                "prior_qualifying_anomalies_60s": 1,
+                "prior_qualifying_anomalies_30s": 0,
+            },
+            {
+                "entry_signal_key": "b",
+                "regime": "calm",
+                "entry_session": "asia",
+                "entry_anomaly_percentile": 0.991,
+                "mfe_r": 0.2,
+                "mae_r": -0.4,
+                "time_to_first_0_5R": None,
+                "mfe_price_move": 0.2,
+                "stop_size": 1.0,
+                "timeout_sec": 120.0,
+                "prior_qualifying_anomalies_120s": 0,
+                "prior_qualifying_anomalies_60s": 0,
+                "prior_qualifying_anomalies_30s": 0,
+            },
+        ],
+    )
+    summary = _build_regime_attribution([result])
+    assert "cohort_definition" in summary
+    assert "by_variant" in summary
+    assert "signal_level" in summary
+    assert "by_regime" in summary
+    assert "by_anomaly_percentile_bucket" in summary
+    assert "feature_comparison" in summary
+    assert "session_attribution" in summary
+    assert "signal_clustering" in summary
+    assert "liquidity_wall_attribution" in summary
+    assert summary["by_variant"][0]["tier_a_count"] == 1
 
 
 def test_invalid_stop_rejected(tmp_path):

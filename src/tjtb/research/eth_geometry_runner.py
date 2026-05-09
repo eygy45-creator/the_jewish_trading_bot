@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import logging
+from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,40 @@ EXCURSION_TIME_FIELDS = {
     1.5: "time_to_first_1_5R",
     2.0: "time_to_first_2R",
 }
+CLUSTER_WINDOWS_SEC = [30.0, 60.0, 120.0]
+ATTRIBUTION_FEATURE_FIELDS = [
+    "entry_anomaly_percentile",
+    "entry_anomaly_score",
+    "entry_direction",
+    "entry_regime",
+    "entry_z_tob",
+    "entry_z_micro",
+    "entry_z_pressure",
+    "entry_z_event_rate",
+    "entry_z_trade_count",
+    "entry_z_spread",
+    "entry_z_mid_vol",
+    "entry_tob_imbalance",
+    "entry_microprice_deviation",
+    "entry_signed_book_pressure",
+    "entry_event_rate",
+    "entry_trade_count",
+    "entry_spread",
+    "entry_mid_price_volatility",
+    "entry_mid_price",
+    "entry_best_bid_size",
+    "entry_best_ask_size",
+    "entry_bid_ask_size_ratio",
+    "entry_liquidity_imbalance",
+    "entry_session",
+    "entry_signal_key",
+    "prior_qualifying_anomalies_30s",
+    "prior_qualifying_anomalies_60s",
+    "prior_qualifying_anomalies_120s",
+    "is_repeated_signal_30s",
+    "is_repeated_signal_60s",
+    "is_repeated_signal_120s",
+]
 
 
 @dataclass
@@ -77,6 +112,8 @@ class ExcursionState:
     timeout_sec: float
     mfe_r: float = 0.0
     mae_r: float = 0.0
+    mfe_price_move: float = 0.0
+    mae_price_move: float = 0.0
     seconds_to_mfe: float = 0.0
     seconds_to_mae: float = 0.0
     max_price_reached: float = 0.0
@@ -114,10 +151,12 @@ class ExcursionState:
 
         if favorable_r > self.mfe_r:
             self.mfe_r = favorable_r
+            self.mfe_price_move = max(0.0, favorable_r * self.stop_distance)
             self.seconds_to_mfe = elapsed
         mae_r = -max(0.0, adverse_r)
         if mae_r < self.mae_r:
             self.mae_r = mae_r
+            self.mae_price_move = abs(mae_r) * self.stop_distance
             self.seconds_to_mae = elapsed
 
         for level, field_name in EXCURSION_TIME_FIELDS.items():
@@ -131,6 +170,8 @@ class ExcursionState:
         return {
             "mfe_r": self.mfe_r,
             "mae_r": self.mae_r,
+            "mfe_price_move": self.mfe_price_move,
+            "mae_price_move": self.mae_price_move,
             "seconds_to_mfe": self.seconds_to_mfe,
             "seconds_to_mae": self.seconds_to_mae,
             "max_price_reached": self.max_price_reached,
@@ -159,11 +200,15 @@ class EthGeometryEngine(StopGridEngine):
         self._next_excursion_id = 1
         self._active_excursions: dict[int, ExcursionState] = {}
         self._closed_trade_by_excursion_id: dict[int, dict[str, Any]] = {}
+        self._pending_entry_features: dict[str, Any] | None = None
+        self._qualifying_signal_times: deque[float] = deque()
 
     def _take_trade(self, top: TopState, regime: str, tp_r: float, be_trigger: float | None) -> None:
         super()._take_trade(top, regime, tp_r, be_trigger)
         if self.open_trade is None:
             return
+        if self._pending_entry_features is not None:
+            self.open_trade.update(self._pending_entry_features)
         trade_id = self._next_excursion_id
         self._next_excursion_id += 1
         self.open_trade["_excursion_id"] = trade_id
@@ -190,6 +235,9 @@ class EthGeometryEngine(StopGridEngine):
             "r_value": r_value,
             "regime": t["regime"],
         }
+        for field_name in ATTRIBUTION_FEATURE_FIELDS:
+            if field_name in t:
+                rec[field_name] = t[field_name]
         trade_id = t.get("_excursion_id")
         if isinstance(trade_id, int):
             state = self._active_excursions.get(trade_id)
@@ -223,6 +271,163 @@ class EthGeometryEngine(StopGridEngine):
                 rec.update(state.to_output())
             del self._active_excursions[trade_id]
 
+    def _prior_cluster_counts(self, ts: float) -> dict[str, int]:
+        max_window = max(CLUSTER_WINDOWS_SEC)
+        while self._qualifying_signal_times and self._qualifying_signal_times[0] < ts - max_window:
+            self._qualifying_signal_times.popleft()
+        return {
+            f"prior_qualifying_anomalies_{int(window)}s": sum(
+                1 for prior_ts in self._qualifying_signal_times if prior_ts >= ts - window
+            )
+            for window in CLUSTER_WINDOWS_SEC
+        }
+
+    def _entry_features(
+        self,
+        *,
+        top: TopState,
+        pressure: float,
+        event_rate: float,
+        trade_count: float,
+        mid_vol: float,
+        z_tob: float | None,
+        z_micro: float | None,
+        z_pressure: float | None,
+        z_event: float | None,
+        z_trade: float | None,
+        z_spread: float | None,
+        z_mid_vol: float | None,
+        anomaly_score: float,
+        anomaly_percentile: float,
+        direction: str,
+        regime: str,
+        cluster_counts: dict[str, int],
+    ) -> dict[str, Any]:
+        size_denom = top.best_bid_sz + top.best_ask_sz
+        size_ratio = top.best_bid_sz / top.best_ask_sz if top.best_ask_sz > 0 else None
+        liquidity_imb = ((top.best_bid_sz - top.best_ask_sz) / size_denom) if size_denom > 0 else None
+        out: dict[str, Any] = {
+            "entry_anomaly_percentile": anomaly_percentile,
+            "entry_anomaly_score": anomaly_score,
+            "entry_direction": direction,
+            "entry_regime": regime,
+            "entry_z_tob": z_tob,
+            "entry_z_micro": z_micro,
+            "entry_z_pressure": z_pressure,
+            "entry_z_event_rate": z_event,
+            "entry_z_trade_count": z_trade,
+            "entry_z_spread": z_spread,
+            "entry_z_mid_vol": z_mid_vol,
+            "entry_tob_imbalance": top.tob_imb,
+            "entry_microprice_deviation": top.micro_dev,
+            "entry_signed_book_pressure": pressure,
+            "entry_event_rate": event_rate,
+            "entry_trade_count": trade_count,
+            "entry_spread": top.spread,
+            "entry_mid_price_volatility": mid_vol,
+            "entry_mid_price": top.mid,
+            "entry_best_bid_size": top.best_bid_sz,
+            "entry_best_ask_size": top.best_ask_sz,
+            "entry_bid_ask_size_ratio": size_ratio,
+            "entry_liquidity_imbalance": liquidity_imb,
+            "entry_session": _entry_session_label(top.ts),
+            "entry_signal_key": f"{top.ts_text}|{direction}|{top.mid:.8f}",
+        }
+        out.update(cluster_counts)
+        for window in CLUSTER_WINDOWS_SEC:
+            count = int(cluster_counts.get(f"prior_qualifying_anomalies_{int(window)}s", 0))
+            out[f"is_repeated_signal_{int(window)}s"] = count > 0
+        return out
+
+    def process_object(self, obj: dict[str, Any]) -> None:
+        self.raw_events_seen += 1
+        self._process_trade_msg(obj)
+        top, pressure = self._process_l2_msg(obj)
+        if top is None:
+            return
+
+        self._expire_windows(top.ts)
+        self.mid_window.append((top.ts, top.mid))
+        self.last_mid = top.mid
+        self._maybe_manage_open_trade(top)
+
+        event_rate = len(self.l2_times) / max(15.0, 1e-9)
+        trade_count = float(len(self.trade_times))
+        mid_vals = [m for _, m in self.mid_window]
+        mid_vol = 0.0
+        if len(mid_vals) >= 2:
+            mu = sum(mid_vals) / len(mid_vals)
+            var = sum((x - mu) ** 2 for x in mid_vals) / (len(mid_vals) - 1)
+            mid_vol = (var if var > 0 else 0.0) ** 0.5
+
+        z_tob = self.z_stats["tob"].zscore_before(top.ts, top.tob_imb)
+        z_micro = self.z_stats["micro"].zscore_before(top.ts, top.micro_dev)
+        z_pressure = self.z_stats["pressure"].zscore_before(top.ts, pressure)
+        z_event = self.z_stats["event_rate"].zscore_before(top.ts, event_rate)
+        z_trade = self.z_stats["trade_count"].zscore_before(top.ts, trade_count)
+        z_spread = self.z_stats["spread"].zscore_before(top.ts, top.spread)
+        z_mid_vol = self.z_stats["mid_vol"].zscore_before(top.ts, mid_vol)
+
+        for k, v in (
+            ("tob", top.tob_imb),
+            ("micro", top.micro_dev),
+            ("pressure", pressure),
+            ("event_rate", event_rate),
+            ("trade_count", trade_count),
+            ("spread", top.spread),
+            ("mid_vol", mid_vol),
+        ):
+            self.z_stats[k].add(top.ts, v)
+
+        abs_parts = [abs(z) for z in (z_tob, z_micro, z_pressure, z_event) if z is not None]
+        if not abs_parts:
+            return
+        anomaly_score = max(abs_parts)
+        bullish = max([z for z in (z_tob, z_micro, z_pressure) if z is not None] + [0.0])
+        bearish = max([(-z) for z in (z_tob, z_micro, z_pressure) if z is not None] + [0.0])
+        direction = "bearish" if bearish > bullish else ("bullish" if bullish > bearish else "neutral")
+
+        pct = self.rank.rank_before(top.ts, anomaly_score)
+        self.rank.add(top.ts, anomaly_score)
+        current_regime = self._regime(z_event, z_spread, z_mid_vol, z_trade)
+
+        if pct is None:
+            return
+        if direction == "bearish" and pct >= 0.99:
+            cluster_counts = self._prior_cluster_counts(top.ts)
+            self.signals_seen += 1
+            can, reason = self._can_take_trade(top.ts, current_regime)
+            if can and self.open_trade is None:
+                tp_r, be_trigger = self._regime_params(current_regime)
+                self._pending_entry_features = self._entry_features(
+                    top=top,
+                    pressure=pressure,
+                    event_rate=event_rate,
+                    trade_count=trade_count,
+                    mid_vol=mid_vol,
+                    z_tob=z_tob,
+                    z_micro=z_micro,
+                    z_pressure=z_pressure,
+                    z_event=z_event,
+                    z_trade=z_trade,
+                    z_spread=z_spread,
+                    z_mid_vol=z_mid_vol,
+                    anomaly_score=anomaly_score,
+                    anomaly_percentile=pct,
+                    direction=direction,
+                    regime=current_regime,
+                    cluster_counts=cluster_counts,
+                )
+                try:
+                    self._take_trade(top, current_regime, tp_r, be_trigger)
+                finally:
+                    self._pending_entry_features = None
+                self.last_signal_ts = top.ts
+            else:
+                self.trades_blocked += 1
+                self.trades_blocked_by_reason[reason] = self.trades_blocked_by_reason.get(reason, 0) + 1
+            self._qualifying_signal_times.append(top.ts)
+
     def _maybe_manage_open_trade(self, top: TopState) -> None:
         self._update_active_excursions(top)
         t = self.open_trade
@@ -252,6 +457,19 @@ class EthGeometryEngine(StopGridEngine):
 def _per_trade_net_r(entry_price: float, gross_r: float, fee_rate: float = ROUND_TRIP_TAKER_FEE) -> float:
     """Subtract round-trip taker fee expressed in price-per-unit terms."""
     return gross_r - float(entry_price) * fee_rate
+
+
+def _entry_session_label(ts: float) -> str:
+    h = datetime.fromtimestamp(float(ts), tz=timezone.utc).hour
+    if 0 <= h < 6:
+        return "asia"
+    if 6 <= h < 12:
+        return "london"
+    if 12 <= h < 16:
+        return "london_ny_overlap"
+    if 16 <= h < 20:
+        return "new_york"
+    return "off_hours"
 
 
 def _average_fee_cost_r(entry_prices: list[float], stop_size: float, fee_rate: float = ROUND_TRIP_TAKER_FEE) -> float:
@@ -312,7 +530,7 @@ def run_eth_geometry_grid(
                 for obj in objs:
                     eng.process_object(obj)
                 eng.finalize_excursions()
-                closed = eng.closed_trades
+                closed = [dict(t, stop_size=stop, timeout_sec=tout) for t in eng.closed_trades]
                 rs_gross = [float(t["r_value"]) for t in closed]
                 n = len(closed)
                 wins = sum(1 for x in rs_gross if x > 0)
@@ -511,6 +729,216 @@ def _build_excursion_analysis(results: list[EthGeometryResult]) -> dict[str, Any
     }
 
 
+def _cohort_for_trade(trade: dict[str, Any]) -> str:
+    mfe = float(trade.get("mfe_r") or 0.0)
+    mae_abs = abs(float(trade.get("mae_r") or 0.0))
+    t05 = trade.get("time_to_first_0_5R")
+    if mfe >= 0.75 and mae_abs <= 0.30 and t05 is not None and float(t05) <= 180.0:
+        return "tier_a_fast_clean_winner"
+    if mfe >= 1.0:
+        return "tier_b_slow_noisy_winner"
+    if mfe < 0.5:
+        return "tier_c_dead_signal"
+    return "uncategorized_middle"
+
+
+def _anomaly_percentile_bucket(pct: Any) -> str:
+    if pct is None:
+        return "unknown"
+    val = float(pct)
+    if val >= 0.999:
+        return "99.9+"
+    if val >= 0.995:
+        return "99.5-99.9"
+    if val >= 0.99:
+        return "99.0-99.5"
+    return "below_99"
+
+
+def _median(values: list[float]) -> float | None:
+    return _percentile(values, 50)
+
+
+def _median_field(trades: list[dict[str, Any]], field_name: str) -> float | None:
+    vals = [float(t[field_name]) for t in trades if t.get(field_name) is not None]
+    return _median(vals)
+
+
+def _summarize_attribution_group(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    n = len(trades)
+    tiers = [_cohort_for_trade(t) for t in trades]
+    mfe_vals = [float(t["mfe_r"]) for t in trades if t.get("mfe_r") is not None]
+    tier_a = sum(1 for x in tiers if x == "tier_a_fast_clean_winner")
+    tier_b = sum(1 for x in tiers if x == "tier_b_slow_noisy_winner")
+    tier_c = sum(1 for x in tiers if x == "tier_c_dead_signal")
+    return {
+        "trade_count": n,
+        "tier_a_count": tier_a,
+        "tier_a_rate": tier_a / n if n else 0.0,
+        "tier_b_count": tier_b,
+        "tier_b_rate": tier_b / n if n else 0.0,
+        "tier_c_count": tier_c,
+        "tier_c_rate": tier_c / n if n else 0.0,
+        "median_mfe": _percentile(mfe_vals, 50),
+        "p75_mfe": _percentile(mfe_vals, 75),
+    }
+
+
+def _group_by(trades: list[dict[str, Any]], field_name: str) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        key = str(trade.get(field_name) or "unknown")
+        groups.setdefault(key, []).append(trade)
+    return groups
+
+
+def _feature_medians(trades: list[dict[str, Any]], features: list[str]) -> dict[str, float | None]:
+    return {feature: _median_field(trades, feature) for feature in features}
+
+
+def _feature_comparison(trades: list[dict[str, Any]], features: list[str]) -> dict[str, Any]:
+    tier_a = [t for t in trades if _cohort_for_trade(t) == "tier_a_fast_clean_winner"]
+    tier_c = [t for t in trades if _cohort_for_trade(t) == "tier_c_dead_signal"]
+    return {
+        "tier_a_trade_count": len(tier_a),
+        "tier_c_trade_count": len(tier_c),
+        "tier_a_medians": _feature_medians(tier_a, features),
+        "tier_c_medians": _feature_medians(tier_c, features),
+        "median_differences_tier_a_minus_tier_c": {
+            feature: (
+                (_median_field(tier_a, feature) - _median_field(tier_c, feature))
+                if _median_field(tier_a, feature) is not None and _median_field(tier_c, feature) is not None
+                else None
+            )
+            for feature in features
+        },
+    }
+
+
+def _rows_from_groups(groups: dict[str, list[dict[str, Any]]], label: str) -> list[dict[str, Any]]:
+    return [
+        {label: key, **_summarize_attribution_group(group)}
+        for key, group in sorted(groups.items(), key=lambda kv: kv[0])
+    ]
+
+
+def _dedupe_signal_level(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    variants: dict[str, dict[str, set[float]]] = {}
+    for trade in trades:
+        key = str(trade.get("entry_signal_key") or f"{trade.get('entry_ts')}|{trade.get('side')}|{trade.get('entry_price')}")
+        state = variants.setdefault(key, {"stops": set(), "timeouts": set()})
+        if trade.get("stop_size") is not None:
+            state["stops"].add(float(trade["stop_size"]))
+        if trade.get("timeout_sec") is not None:
+            state["timeouts"].add(float(trade["timeout_sec"]))
+        current = by_key.get(key)
+        if current is None:
+            by_key[key] = dict(trade)
+            continue
+        current_timeout = float(current.get("timeout_sec") or 0.0)
+        trade_timeout = float(trade.get("timeout_sec") or 0.0)
+        current_mfe_move = float(current.get("mfe_price_move") or 0.0)
+        trade_mfe_move = float(trade.get("mfe_price_move") or 0.0)
+        if (trade_timeout, trade_mfe_move) > (current_timeout, current_mfe_move):
+            by_key[key] = dict(trade)
+    out = []
+    for key, trade in by_key.items():
+        state = variants.get(key, {"stops": set(), "timeouts": set()})
+        row = dict(trade)
+        row["variants_seen"] = len(state["stops"]) * len(state["timeouts"])
+        row["stops_seen"] = sorted(state["stops"])
+        row["timeouts_seen"] = sorted(state["timeouts"])
+        row["signal_level_cohort"] = _cohort_for_trade(row)
+        out.append(row)
+    return out
+
+
+def _build_signal_clustering(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    groups = {
+        "isolated_120s": [t for t in trades if int(t.get("prior_qualifying_anomalies_120s") or 0) == 0],
+        "repeated_120s": [t for t in trades if int(t.get("prior_qualifying_anomalies_120s") or 0) > 0],
+        "repeated_60s": [t for t in trades if int(t.get("prior_qualifying_anomalies_60s") or 0) > 0],
+        "repeated_30s": [t for t in trades if int(t.get("prior_qualifying_anomalies_30s") or 0) > 0],
+    }
+    return {
+        "definition": "prior qualifying bearish anomaly means direction == bearish and anomaly_percentile >= 0.99 before this entry",
+        "groups": _rows_from_groups(groups, "cluster_type"),
+    }
+
+
+def _build_regime_attribution(results: list[EthGeometryResult]) -> dict[str, Any]:
+    all_trades = [dict(t) for result in results for t in result.trades]
+    micro_features = [
+        "entry_tob_imbalance",
+        "entry_microprice_deviation",
+        "entry_signed_book_pressure",
+        "entry_event_rate",
+        "entry_trade_count",
+        "entry_spread",
+        "entry_mid_price_volatility",
+        "entry_z_tob",
+        "entry_z_micro",
+        "entry_z_pressure",
+        "entry_z_event_rate",
+        "entry_z_trade_count",
+        "entry_z_spread",
+        "entry_z_mid_vol",
+    ]
+    liquidity_features = [
+        "entry_best_bid_size",
+        "entry_best_ask_size",
+        "entry_bid_ask_size_ratio",
+        "entry_liquidity_imbalance",
+        "entry_signed_book_pressure",
+    ]
+    by_variant = [
+        {
+            "stop_size": result.stop_size,
+            "timeout_sec": result.timeout_sec,
+            **_summarize_attribution_group([dict(t) for t in result.trades]),
+        }
+        for result in results
+    ]
+    signal_level = _dedupe_signal_level(all_trades)
+    anomaly_groups: dict[str, list[dict[str, Any]]] = {}
+    for trade in all_trades:
+        anomaly_groups.setdefault(_anomaly_percentile_bucket(trade.get("entry_anomaly_percentile")), []).append(trade)
+
+    return {
+        "cohort_definition": {
+            "tier_a_fast_clean_winner": "mfe_r >= 0.75 and abs(mae_r) <= 0.30 and time_to_first_0_5R <= 180s",
+            "tier_b_slow_noisy_winner": "mfe_r >= 1.0 and not Tier A",
+            "tier_c_dead_signal": "mfe_r < 0.5",
+            "uncategorized_middle": "all other trades",
+        },
+        "by_variant": by_variant,
+        "signal_level": {
+            "deduplication_key": "entry_signal_key; one row per entry signal, selecting the longest timeout observation and strongest absolute MFE tie-break",
+            "signal_count": len(signal_level),
+            "summary": _summarize_attribution_group(signal_level),
+            "by_regime": _rows_from_groups(_group_by(signal_level, "regime"), "regime"),
+            "by_session": _rows_from_groups(_group_by(signal_level, "entry_session"), "session"),
+            "signal_clustering": _build_signal_clustering(signal_level),
+        },
+        "by_regime": _rows_from_groups(_group_by(all_trades, "regime"), "regime"),
+        "by_anomaly_percentile_bucket": _rows_from_groups(anomaly_groups, "anomaly_percentile_bucket"),
+        "feature_comparison": _feature_comparison(all_trades, micro_features),
+        "session_attribution": _rows_from_groups(_group_by(all_trades, "entry_session"), "session"),
+        "signal_clustering": _build_signal_clustering(all_trades),
+        "liquidity_wall_attribution": {
+            "available_fields": liquidity_features,
+            "unavailable_fields": [
+                "bid_depletion",
+                "ask_depletion",
+                "passive_absorption_behavior",
+                "liquidity_disappears_vs_absorbs",
+            ],
+            "comparison": _feature_comparison(all_trades, liquidity_features),
+        },
+    }
+
+
 def write_eth_geometry_reports(
     results: list[EthGeometryResult],
     csv_path: Path,
@@ -543,6 +971,7 @@ def write_eth_geometry_reports(
         "best_by_survivability": _result_summary_dict(best_surv),
         "best_realistic_execution_candidate": _result_summary_dict(best_real),
         "excursion_analysis": _build_excursion_analysis(results),
+        "regime_attribution": _build_regime_attribution(results),
         "results": [_sanitize_json_row(asdict(r)) for r in results],
     }
 
