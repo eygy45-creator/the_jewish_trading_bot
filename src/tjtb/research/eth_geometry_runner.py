@@ -26,7 +26,7 @@ from tjtb.runtime_paths import RAW_DATA_DIR, REPORTS_DIR
 LOGGER = logging.getLogger("tjtb.research.eth_geometry")
 
 DEFAULT_STOPS = [1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
-DEFAULT_TIMEOUTS_SEC = [2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 90.0, 120.0]
+DEFAULT_TIMEOUTS_SEC = [120.0, 180.0, 300.0, 480.0, 600.0, 900.0]
 RISK_PER_TRADE = 0.0025
 ROUND_TRIP_TAKER_FEE = 0.0011  # 0.11% of notional, round-trip
 ACCOUNT_SIZES = [5_000.0, 10_000.0, 50_000.0]
@@ -327,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ETH geometry grid: stops × timeouts, fees, leverage")
     parser.add_argument("--data-source", choices=("coinbase", "bybit"), default="bybit")
     parser.add_argument("--stops", default="1,2,3,5,8,10")
-    parser.add_argument("--timeouts", default="2,5,10,15,30,60,90,120", help="Comma-separated timeout seconds")
+    parser.add_argument("--timeouts", default="120,180,300,480,600,900", help="Comma-separated timeout seconds")
     parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
     parser.add_argument("--symbol", default="ETHUSDT")
     parser.add_argument("--fee-rate", type=float, default=ROUND_TRIP_TAKER_FEE, help="Round-trip fee as decimal")
