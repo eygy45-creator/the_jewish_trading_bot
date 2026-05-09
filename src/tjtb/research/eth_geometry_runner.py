@@ -6,7 +6,7 @@ import argparse
 import csv
 import json
 import logging
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
@@ -30,6 +30,15 @@ DEFAULT_TIMEOUTS_SEC = [120.0, 180.0, 300.0, 480.0, 600.0, 900.0]
 RISK_PER_TRADE = 0.0025
 ROUND_TRIP_TAKER_FEE = 0.0011  # 0.11% of notional, round-trip
 ACCOUNT_SIZES = [5_000.0, 10_000.0, 50_000.0]
+EXCURSION_LEVELS_R = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+EXCURSION_TIME_FIELDS = {
+    0.25: "time_to_first_0_25R",
+    0.5: "time_to_first_0_5R",
+    0.75: "time_to_first_0_75R",
+    1.0: "time_to_first_1R",
+    1.5: "time_to_first_1_5R",
+    2.0: "time_to_first_2R",
+}
 
 
 @dataclass
@@ -55,6 +64,84 @@ class EthGeometryResult:
     average_fee_cost_r: float
     net_average_r_after_fees: float
     net_total_r_after_fees: float
+    trades: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ExcursionState:
+    trade_id: int
+    side: str
+    entry_ts: float
+    entry_price: float
+    stop_distance: float
+    timeout_sec: float
+    mfe_r: float = 0.0
+    mae_r: float = 0.0
+    seconds_to_mfe: float = 0.0
+    seconds_to_mae: float = 0.0
+    max_price_reached: float = 0.0
+    min_price_reached: float = 0.0
+    finalized: bool = False
+    time_to_first_0_25R: float | None = None
+    time_to_first_0_5R: float | None = None
+    time_to_first_0_75R: float | None = None
+    time_to_first_1R: float | None = None
+    time_to_first_1_5R: float | None = None
+    time_to_first_2R: float | None = None
+
+    def __post_init__(self) -> None:
+        self.side = str(self.side).lower()
+        if self.side not in {"short", "long"}:
+            raise ValueError("side must be 'short' or 'long'")
+        if self.stop_distance <= 0:
+            raise ValueError("stop_distance must be > 0")
+        self.max_price_reached = self.entry_price
+        self.min_price_reached = self.entry_price
+
+    def update(self, ts: float, price: float) -> None:
+        if self.finalized:
+            return
+        elapsed = max(0.0, float(ts) - self.entry_ts)
+        self.max_price_reached = max(self.max_price_reached, float(price))
+        self.min_price_reached = min(self.min_price_reached, float(price))
+
+        if self.side == "short":
+            favorable_r = (self.entry_price - self.min_price_reached) / self.stop_distance
+            adverse_r = (self.max_price_reached - self.entry_price) / self.stop_distance
+        else:
+            favorable_r = (self.max_price_reached - self.entry_price) / self.stop_distance
+            adverse_r = (self.entry_price - self.min_price_reached) / self.stop_distance
+
+        if favorable_r > self.mfe_r:
+            self.mfe_r = favorable_r
+            self.seconds_to_mfe = elapsed
+        mae_r = -max(0.0, adverse_r)
+        if mae_r < self.mae_r:
+            self.mae_r = mae_r
+            self.seconds_to_mae = elapsed
+
+        for level, field_name in EXCURSION_TIME_FIELDS.items():
+            if favorable_r >= level and getattr(self, field_name) is None:
+                setattr(self, field_name, elapsed)
+
+        if elapsed >= self.timeout_sec:
+            self.finalized = True
+
+    def to_output(self) -> dict[str, Any]:
+        return {
+            "mfe_r": self.mfe_r,
+            "mae_r": self.mae_r,
+            "seconds_to_mfe": self.seconds_to_mfe,
+            "seconds_to_mae": self.seconds_to_mae,
+            "max_price_reached": self.max_price_reached,
+            "min_price_reached": self.min_price_reached,
+            "time_to_first_0_25R": self.time_to_first_0_25R,
+            "time_to_first_0_5R": self.time_to_first_0_5R,
+            "time_to_first_0_75R": self.time_to_first_0_75R,
+            "time_to_first_1R": self.time_to_first_1R,
+            "time_to_first_1_5R": self.time_to_first_1_5R,
+            "time_to_first_2R": self.time_to_first_2R,
+        }
 
 
 class EthGeometryEngine(StopGridEngine):
@@ -69,8 +156,75 @@ class EthGeometryEngine(StopGridEngine):
     ) -> None:
         super().__init__(logger, data_source=data_source, stop_size=stop_size)
         self.timeout_sec = float(timeout_sec)
+        self._next_excursion_id = 1
+        self._active_excursions: dict[int, ExcursionState] = {}
+        self._closed_trade_by_excursion_id: dict[int, dict[str, Any]] = {}
+
+    def _take_trade(self, top: TopState, regime: str, tp_r: float, be_trigger: float | None) -> None:
+        super()._take_trade(top, regime, tp_r, be_trigger)
+        if self.open_trade is None:
+            return
+        trade_id = self._next_excursion_id
+        self._next_excursion_id += 1
+        self.open_trade["_excursion_id"] = trade_id
+        self._active_excursions[trade_id] = ExcursionState(
+            trade_id=trade_id,
+            side=str(self.open_trade["side"]),
+            entry_ts=float(self.open_trade["entry_ts_unix"]),
+            entry_price=float(self.open_trade["entry_price"]),
+            stop_distance=self.stop_size,
+            timeout_sec=self.timeout_sec,
+        )
+
+    def _close_trade(self, exit_ts: str, exit_price: float, outcome: str, r_value: float) -> None:
+        t = self.open_trade
+        if t is None:
+            return
+        rec: dict[str, Any] = {
+            "entry_ts": t["entry_ts"],
+            "exit_ts": exit_ts,
+            "side": t["side"],
+            "entry_price": t["entry_price"],
+            "exit_price": exit_price,
+            "outcome": outcome,
+            "r_value": r_value,
+            "regime": t["regime"],
+        }
+        trade_id = t.get("_excursion_id")
+        if isinstance(trade_id, int):
+            state = self._active_excursions.get(trade_id)
+            if state is not None:
+                rec.update(state.to_output())
+            self._closed_trade_by_excursion_id[trade_id] = rec
+        self.closed_trades.append(rec)
+        self.realized_pnl_r += r_value
+        self.equity_curve.append(self.realized_pnl_r)
+        if r_value < 0:
+            self._curr_losing_streak += 1
+            self.max_losing_streak = max(self.max_losing_streak, self._curr_losing_streak)
+        else:
+            self._curr_losing_streak = 0
+        self.open_trade = None
+
+    def _update_active_excursions(self, top: TopState) -> None:
+        for trade_id, state in list(self._active_excursions.items()):
+            state.update(top.ts, top.mid)
+            rec = self._closed_trade_by_excursion_id.get(trade_id)
+            if rec is not None:
+                rec.update(state.to_output())
+            if state.finalized and rec is not None:
+                del self._active_excursions[trade_id]
+
+    def finalize_excursions(self) -> None:
+        for trade_id, state in list(self._active_excursions.items()):
+            state.finalized = True
+            rec = self._closed_trade_by_excursion_id.get(trade_id)
+            if rec is not None:
+                rec.update(state.to_output())
+            del self._active_excursions[trade_id]
 
     def _maybe_manage_open_trade(self, top: TopState) -> None:
+        self._update_active_excursions(top)
         t = self.open_trade
         if t is None:
             return
@@ -157,6 +311,7 @@ def run_eth_geometry_grid(
                 eng = EthGeometryEngine(LOGGER, data_source=data_source, stop_size=stop, timeout_sec=tout)
                 for obj in objs:
                     eng.process_object(obj)
+                eng.finalize_excursions()
                 closed = eng.closed_trades
                 rs_gross = [float(t["r_value"]) for t in closed]
                 n = len(closed)
@@ -204,6 +359,7 @@ def run_eth_geometry_grid(
                         average_fee_cost_r=avg_fee_r,
                         net_average_r_after_fees=avg_net,
                         net_total_r_after_fees=total_net,
+                        trades=[dict(t) for t in closed],
                     )
                 )
     finally:
@@ -284,6 +440,77 @@ def _result_summary_dict(r: EthGeometryResult | None) -> dict[str, Any] | None:
     return _sanitize_json_row(asdict(r))
 
 
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    if pct < 0 or pct > 100:
+        raise ValueError("pct must be between 0 and 100")
+    xs = sorted(float(v) for v in values)
+    if len(xs) == 1:
+        return xs[0]
+    rank = (pct / 100.0) * (len(xs) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = rank - lo
+    return xs[lo] + ((xs[hi] - xs[lo]) * frac)
+
+
+def _average_present(values: list[float | None]) -> float | None:
+    present = [float(v) for v in values if v is not None]
+    return mean(present) if present else None
+
+
+def _excursion_metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    mfe_vals = [float(t["mfe_r"]) for t in trades if t.get("mfe_r") is not None]
+    mae_vals = [float(t["mae_r"]) for t in trades if t.get("mae_r") is not None]
+    n = len(trades)
+    reaching: dict[str, float] = {}
+    for level, field_name in EXCURSION_TIME_FIELDS.items():
+        reaching[f"percent_reaching_{field_name.removeprefix('time_to_first_')}"] = (
+            sum(1 for t in trades if t.get(field_name) is not None) / n if n else 0.0
+        )
+
+    return {
+        "total_trades": n,
+        "mfe_percentiles": {
+            "p50": _percentile(mfe_vals, 50),
+            "p75": _percentile(mfe_vals, 75),
+            "p90": _percentile(mfe_vals, 90),
+            "p95": _percentile(mfe_vals, 95),
+        },
+        "mae_percentiles": {
+            "p50": _percentile(mae_vals, 50),
+            "p75": _percentile(mae_vals, 75),
+            "p90": _percentile(mae_vals, 90),
+            "p95": _percentile(mae_vals, 95),
+        },
+        "reachability": reaching,
+        "average_time_to_0_25R": _average_present([t.get("time_to_first_0_25R") for t in trades]),
+        "average_time_to_0_5R": _average_present([t.get("time_to_first_0_5R") for t in trades]),
+        "average_time_to_1R": _average_present([t.get("time_to_first_1R") for t in trades]),
+        "average_time_to_peak_mfe": _average_present([t.get("seconds_to_mfe") for t in trades]),
+    }
+
+
+def _build_excursion_analysis(results: list[EthGeometryResult]) -> dict[str, Any]:
+    all_trades: list[dict[str, Any]] = []
+    by_variant: list[dict[str, Any]] = []
+    for r in results:
+        trades = [dict(t) for t in r.trades]
+        all_trades.extend(trades)
+        by_variant.append(
+            {
+                "stop_size": r.stop_size,
+                "timeout_sec": r.timeout_sec,
+                **_excursion_metrics(trades),
+            }
+        )
+    return {
+        "overall": _excursion_metrics(all_trades),
+        "by_variant": by_variant,
+    }
+
+
 def write_eth_geometry_reports(
     results: list[EthGeometryResult],
     csv_path: Path,
@@ -315,6 +542,7 @@ def write_eth_geometry_reports(
         "best_by_raw_expectancy": _result_summary_dict(best_exp),
         "best_by_survivability": _result_summary_dict(best_surv),
         "best_realistic_execution_candidate": _result_summary_dict(best_real),
+        "excursion_analysis": _build_excursion_analysis(results),
         "results": [_sanitize_json_row(asdict(r)) for r in results],
     }
 
