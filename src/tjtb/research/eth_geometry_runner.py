@@ -1,4 +1,7 @@
-"""Research runner: ETHUSDT stop-loss × timeout grid with leverage and taker-fee drag."""
+"""Research runner: ETHUSDT stop-loss × timeout grid with leverage and taker-fee drag.
+
+Use `--study ultimate` (same module CLI) for PR-ULTIMATE edge validation; implementation in
+`tjtb.research.ultimate_edge_study`. Does not modify live execution."""
 
 from __future__ import annotations
 
@@ -11,7 +14,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from typing import Any, Callable
 
 from tjtb.live.live_paper_crypto import BYBIT_RAW_GLOB, RAW_GLOB, TopState
 from tjtb.research.stop_grid_runner import (
@@ -194,9 +197,16 @@ class EthGeometryEngine(StopGridEngine):
         data_source: str,
         stop_size: float,
         timeout_sec: float,
+        *,
+        entry_filter: Callable[[dict[str, Any]], bool] | None = None,
+        research_fixed_tp_r: float | None = None,
+        research_be_mode: str | None = None,
     ) -> None:
         super().__init__(logger, data_source=data_source, stop_size=stop_size)
         self.timeout_sec = float(timeout_sec)
+        self.entry_filter = entry_filter
+        self.research_fixed_tp_r = research_fixed_tp_r
+        self.research_be_mode = research_be_mode
         self._next_excursion_id = 1
         self._active_excursions: dict[int, ExcursionState] = {}
         self._closed_trade_by_excursion_id: dict[int, dict[str, Any]] = {}
@@ -398,8 +408,7 @@ class EthGeometryEngine(StopGridEngine):
             self.signals_seen += 1
             can, reason = self._can_take_trade(top.ts, current_regime)
             if can and self.open_trade is None:
-                tp_r, be_trigger = self._regime_params(current_regime)
-                self._pending_entry_features = self._entry_features(
+                feats = self._entry_features(
                     top=top,
                     pressure=pressure,
                     event_rate=event_rate,
@@ -418,11 +427,31 @@ class EthGeometryEngine(StopGridEngine):
                     regime=current_regime,
                     cluster_counts=cluster_counts,
                 )
-                try:
-                    self._take_trade(top, current_regime, tp_r, be_trigger)
-                finally:
-                    self._pending_entry_features = None
-                self.last_signal_ts = top.ts
+                if self.entry_filter is not None and not self.entry_filter(feats):
+                    self.trades_blocked += 1
+                    self.trades_blocked_by_reason["entry_filter"] = (
+                        self.trades_blocked_by_reason.get("entry_filter", 0) + 1
+                    )
+                else:
+                    tp_r, be_trigger = self._regime_params(current_regime)
+                    if self.research_fixed_tp_r is not None:
+                        tp_r = float(self.research_fixed_tp_r)
+                    if self.research_be_mode is not None:
+                        mode = str(self.research_be_mode).lower()
+                        if mode == "none":
+                            be_trigger = None
+                        elif mode == "0.75":
+                            be_trigger = 0.75
+                        elif mode == "1.0" or mode == "1":
+                            be_trigger = 1.0
+                        else:
+                            raise ValueError(f"unknown research_be_mode: {self.research_be_mode}")
+                    self._pending_entry_features = feats
+                    try:
+                        self._take_trade(top, current_regime, tp_r, be_trigger)
+                    finally:
+                        self._pending_entry_features = None
+                    self.last_signal_ts = top.ts
             else:
                 self.trades_blocked += 1
                 self.trades_blocked_by_reason[reason] = self.trades_blocked_by_reason.get(reason, 0) + 1
@@ -452,6 +481,97 @@ class EthGeometryEngine(StopGridEngine):
         if (top.ts - float(t["entry_ts_unix"])) >= self.timeout_sec:
             r = entry - top.mid
             self._close_trade(top.ts_text, top.mid, "timeout", r)
+
+
+class PartialExitEthGeometryEngine(EthGeometryEngine):
+    """
+    Research-only partial: scale `partial_first_scale` at `partial_first_r` (favorable R),
+    remainder `runner_scale` seeks `runner_tp_r`. Before partial fills, behaves like full TP at research_fixed_tp_r.
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        data_source: str,
+        stop_size: float,
+        timeout_sec: float,
+        *,
+        partial_first_r: float = 0.5,
+        partial_first_scale: float = 0.7,
+        runner_scale: float = 0.3,
+        runner_tp_r: float = 1.5,
+        entry_filter: Callable[[dict[str, Any]], bool] | None = None,
+        research_fixed_tp_r: float | None = None,
+        research_be_mode: str | None = None,
+    ) -> None:
+        super().__init__(
+            logger,
+            data_source,
+            stop_size,
+            timeout_sec,
+            entry_filter=entry_filter,
+            research_fixed_tp_r=research_fixed_tp_r,
+            research_be_mode=research_be_mode,
+        )
+        self._partial_first_r = float(partial_first_r)
+        self._partial_first_scale = float(partial_first_scale)
+        self._runner_scale = float(runner_scale)
+        self._runner_tp_r = float(runner_tp_r)
+
+    def _take_trade(self, top: TopState, regime: str, tp_r: float, be_trigger: float | None) -> None:
+        super()._take_trade(top, regime, tp_r, be_trigger)
+        if self.open_trade is not None:
+            self.open_trade["partial_done"] = False
+            self.open_trade["acc_scaled_r_dollar"] = 0.0
+
+    def _maybe_manage_open_trade(self, top: TopState) -> None:
+        self._update_active_excursions(top)
+        t = self.open_trade
+        if t is None:
+            return
+        entry = float(t["entry_price"])
+        stop_sz = float(self.stop_size)
+        sl_price = float(t["sl_price"])
+        be_trigger = t.get("be_trigger_r")
+        if be_trigger is not None and top.mid <= entry - float(be_trigger):
+            t["sl_price"] = min(t["sl_price"], entry)
+            sl_price = float(t["sl_price"])
+
+        partial_px = entry - self._partial_first_r * stop_sz
+        runner_tp_px = entry - self._runner_tp_r * stop_sz
+        tp_price = float(t["tp_price"])
+        partial_done = bool(t.get("partial_done", False))
+
+        def close_scaled(px: float, remainder_frac: float, outcome: str) -> None:
+            acc_now = float(t.get("acc_scaled_r_dollar", 0.0))
+            total_r = acc_now + remainder_frac * (entry - px)
+            self._close_trade(top.ts_text, px, outcome, total_r)
+
+        if top.mid >= sl_price:
+            rem = self._runner_scale if partial_done else 1.0
+            close_scaled(top.mid, rem, "sl_or_be")
+            return
+
+        if not partial_done:
+            if top.mid <= partial_px:
+                acc_prev = float(t.get("acc_scaled_r_dollar", 0.0))
+                new_acc = acc_prev + self._partial_first_scale * self._partial_first_r * stop_sz
+                t["acc_scaled_r_dollar"] = new_acc
+                t["partial_done"] = True
+                partial_done = True
+
+        if partial_done:
+            if top.mid <= runner_tp_px:
+                close_scaled(top.mid, self._runner_scale, "tp")
+                return
+        else:
+            if top.mid <= tp_price:
+                self._close_trade(top.ts_text, top.mid, "tp", entry - tp_price)
+                return
+
+        if (top.ts - float(t["entry_ts_unix"])) >= self.timeout_sec:
+            rem = self._runner_scale if partial_done else 1.0
+            close_scaled(top.mid, rem, "timeout")
 
 
 def _per_trade_net_r(entry_price: float, gross_r: float, fee_rate: float = ROUND_TRIP_TAKER_FEE) -> float:
@@ -982,6 +1102,12 @@ def write_eth_geometry_reports(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ETH geometry grid: stops × timeouts, fees, leverage")
+    parser.add_argument(
+        "--study",
+        choices=("geometry", "ultimate"),
+        default="geometry",
+        help="geometry=classic grid; ultimate=PR-ULTIMATE edge validation (research JSON)",
+    )
     parser.add_argument("--data-source", choices=("coinbase", "bybit"), default="bybit")
     parser.add_argument("--stops", default="1,2,3,5,8,10")
     parser.add_argument("--timeouts", default="120,180,300,480,600,900", help="Comma-separated timeout seconds")
@@ -990,8 +1116,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fee-rate", type=float, default=ROUND_TRIP_TAKER_FEE, help="Round-trip fee as decimal")
     parser.add_argument("--csv-output", type=Path, default=REPORTS_DIR / "eth_geometry_results.csv")
     parser.add_argument("--json-output", type=Path, default=REPORTS_DIR / "eth_geometry_summary.json")
+    parser.add_argument(
+        "--ultimate-json-output",
+        type=Path,
+        default=REPORTS_DIR / "ultimate_edge_study.json",
+        help="Output path when --study ultimate",
+    )
+    parser.add_argument("--label-stop", type=float, default=5.0, help="Reference stop for Phase 1 tier labeling (ultimate)")
+    parser.add_argument("--label-timeout", type=float, default=900.0, help="Reference timeout for Phase 1 (ultimate)")
+    parser.add_argument("--skip-phase2", action="store_true", help="Ultimate study: Phase 1 (+3) only")
+    parser.add_argument("--skip-phase3", action="store_true", help="Ultimate study: skip execution stress stub")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.study == "ultimate":
+        from tjtb.research.ultimate_edge_study import run_ultimate_study
+
+        run_ultimate_study(
+            data_source=args.data_source,
+            raw_dir=args.raw_dir,
+            symbol=str(args.symbol).strip().upper(),
+            fee_rate=float(args.fee_rate),
+            json_output=args.ultimate_json_output,
+            label_stop=float(args.label_stop),
+            label_timeout=float(args.label_timeout),
+            run_phase2=not args.skip_phase2,
+            run_phase3=not args.skip_phase3,
+        )
+        LOGGER.info("ultimate edge study written to %s", args.ultimate_json_output)
+        return 0
+
     stops = [float(x.strip()) for x in str(args.stops).split(",") if x.strip()]
     timeouts = [float(x.strip()) for x in str(args.timeouts).split(",") if x.strip()]
     results = run_eth_geometry_grid(

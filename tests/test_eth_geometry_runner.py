@@ -12,6 +12,7 @@ from tjtb.research.eth_geometry_runner import (
     DEFAULT_TIMEOUTS_SEC,
     EthGeometryResult,
     EthGeometryEngine,
+    PartialExitEthGeometryEngine,
     ExcursionState,
     ROUND_TRIP_TAKER_FEE,
     _anomaly_percentile_bucket,
@@ -28,6 +29,11 @@ from tjtb.research.eth_geometry_runner import (
     write_eth_geometry_reports,
 )
 from tjtb.research.stop_grid_runner import _avg_notional_and_lev
+from tjtb.research.ultimate_edge_study import (
+    _sanitize_for_json,
+    _summarize_signal_subset,
+    run_ultimate_study,
+)
 
 
 def _write_ndjson(path: Path, rows: list[dict]) -> None:
@@ -387,6 +393,52 @@ def test_invalid_timeout_rejected(tmp_path):
     _write_ndjson(raw, _sample_eth_rows())
     with pytest.raises(ValueError):
         run_eth_geometry_grid(data_source="bybit", raw_dir=tmp_path, stops=[1.0], timeouts_sec=[2.0, 0.0])
+
+
+def test_summarize_signal_subset_tier_a():
+    trades = [
+        {"mfe_r": 0.8, "mae_r": -0.2, "time_to_first_0_5R": 100.0, "time_to_first_1R": None},
+    ]
+    s = _summarize_signal_subset(trades)
+    assert s["signal_count"] == 1
+    assert s["tier_a_rate"] == pytest.approx(1.0)
+
+
+def test_sanitize_for_json_non_finite():
+    assert _sanitize_for_json({"pf": float("inf")})["pf"] is None
+
+
+def test_run_ultimate_study_no_raw_files(tmp_path):
+    doc = run_ultimate_study(raw_dir=tmp_path, data_source="bybit", run_phase2=False, run_phase3=False)
+    assert doc.get("error") == "no_raw_objects"
+
+
+def test_partial_exit_engine_registers_flags():
+    eng = PartialExitEthGeometryEngine(
+        logging.getLogger("tjtb.test.partial"),
+        "bybit",
+        stop_size=2.0,
+        timeout_sec=900.0,
+        research_fixed_tp_r=2.0,
+        research_be_mode="none",
+    )
+    top = _top(0.0, 100.0)
+    eng._take_trade(top, "normal", 2.0, None)
+    assert eng.open_trade is not None
+    assert eng.open_trade.get("partial_done") is False
+
+
+def test_eth_geometry_research_overrides_tp_be():
+    eng = EthGeometryEngine(
+        logging.getLogger("tjtb.test.override"),
+        "bybit",
+        stop_size=1.0,
+        timeout_sec=2.0,
+        research_fixed_tp_r=1.25,
+        research_be_mode="none",
+    )
+    assert eng.research_fixed_tp_r == pytest.approx(1.25)
+    assert eng.research_be_mode == "none"
 
 
 def test_production_defaults_unchanged(tmp_path, monkeypatch):
