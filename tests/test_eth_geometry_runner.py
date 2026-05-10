@@ -15,6 +15,7 @@ from tjtb.research.eth_geometry_runner import (
     PartialExitEthGeometryEngine,
     ExcursionState,
     ROUND_TRIP_TAKER_FEE,
+    compute_failed_absorption_entry_features,
     _anomaly_percentile_bucket,
     _average_fee_cost_r,
     _build_regime_attribution,
@@ -29,6 +30,7 @@ from tjtb.research.eth_geometry_runner import (
     write_eth_geometry_reports,
 )
 from tjtb.research.stop_grid_runner import _avg_notional_and_lev
+from tjtb.research.pr_final_entry_study import is_clean_2r_winner, run_pr_final_study
 from tjtb.research.ultimate_edge_study import (
     _sanitize_for_json,
     _summarize_signal_subset,
@@ -426,6 +428,57 @@ def test_partial_exit_engine_registers_flags():
     eng._take_trade(top, "normal", 2.0, None)
     assert eng.open_trade is not None
     assert eng.open_trade.get("partial_done") is False
+
+
+def test_compute_failed_absorption_score_bounded():
+    top = live.TopState(
+        ts=100.0,
+        ts_text="2023-11-14T22:00:00+00:00",
+        best_bid=99.0,
+        best_ask=101.0,
+        best_bid_sz=0.5,
+        best_ask_sz=50.0,
+        spread=2.0,
+        mid=100.0,
+        micro_dev=-0.1,
+        tob_imb=-0.98,
+    )
+    out = compute_failed_absorption_entry_features(
+        top=top,
+        pressure=-120.0,
+        event_rate=200.0,
+        trade_count=100.0,
+        mid_vals=[100.0, 99.98, 100.01],
+        bid_peak_recent=40.0,
+        liquidity_imbalance=-0.95,
+        z_pressure=-4.0,
+        z_tob=-3.0,
+        z_event=2.0,
+        z_trade=2.0,
+        is_repeated_signal_30s=True,
+        is_repeated_signal_60s=True,
+        is_repeated_signal_120s=True,
+    )
+    assert 0.0 <= out["entry_failed_absorption_score"] <= 100.0
+    assert out["failed_absorption_strict"] in (True, False)
+
+
+def test_clean_2r_winner_classification():
+    ok = {
+        "stop_size": 2.0,
+        "mfe_r": 2.1,
+        "mae_r": -0.4,
+        "time_to_first_1R": 100.0,
+        "time_to_first_2R": 400.0,
+    }
+    bad_mae = {**ok, "mae_r": -0.6}
+    assert is_clean_2r_winner(ok)
+    assert not is_clean_2r_winner(bad_mae)
+
+
+def test_run_pr_final_empty_raw(tmp_path):
+    doc = run_pr_final_study(raw_dir=tmp_path, run_part_e=False)
+    assert doc.get("error") == "no_raw_objects"
 
 
 def test_eth_geometry_research_overrides_tp_be():

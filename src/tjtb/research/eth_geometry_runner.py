@@ -1,7 +1,7 @@
 """Research runner: ETHUSDT stop-loss × timeout grid with leverage and taker-fee drag.
 
-Use `--study ultimate` (same module CLI) for PR-ULTIMATE edge validation; implementation in
-`tjtb.research.ultimate_edge_study`. Does not modify live execution."""
+Use `--study ultimate` or `--study pr-final` for research batches (`ultimate_edge_study`,
+`pr_final_entry_study`). Does not modify live execution."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Callable
 
-from tjtb.live.live_paper_crypto import BYBIT_RAW_GLOB, RAW_GLOB, TopState
+from tjtb.live.live_paper_crypto import BYBIT_RAW_GLOB, LOOKBACK_SEC, RAW_GLOB, TopState
 from tjtb.research.stop_grid_runner import (
     StopGridEngine,
     _avg_notional_and_lev,
@@ -44,6 +44,111 @@ EXCURSION_TIME_FIELDS = {
     2.0: "time_to_first_2R",
 }
 CLUSTER_WINDOWS_SEC = [30.0, 60.0, 120.0]
+
+
+def compute_failed_absorption_entry_features(
+    *,
+    top: TopState,
+    pressure: float,
+    event_rate: float,
+    trade_count: float,
+    mid_vals: list[float],
+    bid_peak_recent: float,
+    liquidity_imbalance: float | None,
+    z_pressure: float | None,
+    z_tob: float | None,
+    z_event: float | None,
+    z_trade: float | None,
+    is_repeated_signal_30s: bool,
+    is_repeated_signal_60s: bool,
+    is_repeated_signal_120s: bool,
+) -> dict[str, Any]:
+    """
+    Pre-entry-only proxy for bearish failed absorption (research).
+
+    Uses current TOB/L2/trade-intensity z-scores, recent mid range (stall proxy),
+    bid-size fade vs recent peak, and anomaly clustering — no post-entry paths.
+    """
+    score = 0.0
+    mid = float(top.mid)
+    # Stage 1 — aggressive flow into bids
+    if z_pressure is not None and z_pressure < -1.5:
+        score += min(28.0, (-z_pressure - 1.5) * 7.0)
+    if float(top.tob_imb) <= -0.88:
+        score += 18.0
+    elif float(top.tob_imb) <= -0.78:
+        score += 12.0
+    elif float(top.tob_imb) <= -0.65:
+        score += 6.0
+    if pressure < -80.0:
+        score += 10.0
+    elif pressure < -40.0:
+        score += 5.0
+    if z_event is not None and z_event > 0.8:
+        score += min(14.0, (z_event - 0.8) * 6.0)
+    if z_trade is not None and z_trade > 0.8:
+        score += min(14.0, (z_trade - 0.8) * 6.0)
+    raw_act = event_rate + trade_count / max(15.0, 1e-9)
+    if raw_act > 120.0:
+        score += 8.0
+    elif raw_act > 70.0:
+        score += 4.0
+
+    # Stage 2 — stall / absorption test (tight mid range in lookback)
+    mid_range_ratio = 0.0
+    if len(mid_vals) >= 3 and mid > 0:
+        mid_range_ratio = (max(mid_vals) - min(mid_vals)) / mid
+    stall_tight = mid_range_ratio < 0.0011
+    stall_moderate = mid_range_ratio < 0.0022
+    if stall_tight:
+        score += 18.0
+    elif stall_moderate:
+        score += 10.0
+
+    # Stage 3 — bid liquidity fade + bearish imbalance deepening
+    bb = float(top.best_bid_sz)
+    peak = max(float(bid_peak_recent), 1e-12)
+    bid_vs_peak = bb / peak
+    if bid_vs_peak < 0.68:
+        score += 22.0
+    elif bid_vs_peak < 0.82:
+        score += 13.0
+    elif bid_vs_peak < 0.92:
+        score += 6.0
+
+    if liquidity_imbalance is not None:
+        if liquidity_imbalance <= -0.82:
+            score += 10.0
+        elif liquidity_imbalance <= -0.68:
+            score += 5.0
+
+    low_mid = min(mid_vals) if mid_vals else mid
+    at_local_low = mid <= low_mid + mid * 1e-7
+    if at_local_low and stall_moderate:
+        score += 8.0
+
+    score = max(0.0, min(100.0, score))
+
+    loose = score >= 34.0 and (is_repeated_signal_120s or score >= 52.0)
+    medium = score >= 46.0 and is_repeated_signal_60s and bid_vs_peak < 0.92 and stall_moderate
+    strict = (
+        score >= 62.0
+        and is_repeated_signal_30s
+        and stall_tight
+        and bid_vs_peak < 0.78
+        and float(top.tob_imb) <= -0.78
+    )
+
+    return {
+        "entry_failed_absorption_score": score,
+        "entry_mid_range_ratio": mid_range_ratio,
+        "entry_bid_size_vs_peak_ratio": bid_vs_peak,
+        "failed_absorption_loose": loose,
+        "failed_absorption_medium": medium,
+        "failed_absorption_strict": strict,
+    }
+
+
 ATTRIBUTION_FEATURE_FIELDS = [
     "entry_anomaly_percentile",
     "entry_anomaly_score",
@@ -76,6 +181,12 @@ ATTRIBUTION_FEATURE_FIELDS = [
     "is_repeated_signal_30s",
     "is_repeated_signal_60s",
     "is_repeated_signal_120s",
+    "entry_failed_absorption_score",
+    "entry_mid_range_ratio",
+    "entry_bid_size_vs_peak_ratio",
+    "failed_absorption_loose",
+    "failed_absorption_medium",
+    "failed_absorption_strict",
 ]
 
 
@@ -212,6 +323,7 @@ class EthGeometryEngine(StopGridEngine):
         self._closed_trade_by_excursion_id: dict[int, dict[str, Any]] = {}
         self._pending_entry_features: dict[str, Any] | None = None
         self._qualifying_signal_times: deque[float] = deque()
+        self._bb_snapshots: deque[tuple[float, float]] = deque(maxlen=512)
 
     def _take_trade(self, top: TopState, regime: str, tp_r: float, be_trigger: float | None) -> None:
         super()._take_trade(top, regime, tp_r, be_trigger)
@@ -313,6 +425,7 @@ class EthGeometryEngine(StopGridEngine):
         regime: str,
         cluster_counts: dict[str, int],
     ) -> dict[str, Any]:
+        mid_vals = [m for _, m in self.mid_window]
         size_denom = top.best_bid_sz + top.best_ask_sz
         size_ratio = top.best_bid_sz / top.best_ask_sz if top.best_ask_sz > 0 else None
         liquidity_imb = ((top.best_bid_sz - top.best_ask_sz) / size_denom) if size_denom > 0 else None
@@ -347,6 +460,27 @@ class EthGeometryEngine(StopGridEngine):
         for window in CLUSTER_WINDOWS_SEC:
             count = int(cluster_counts.get(f"prior_qualifying_anomalies_{int(window)}s", 0))
             out[f"is_repeated_signal_{int(window)}s"] = count > 0
+
+        bid_peak = bb = float(top.best_bid_sz)
+        if self._bb_snapshots:
+            bid_peak = max(bb for _, bb in self._bb_snapshots)
+        fa = compute_failed_absorption_entry_features(
+            top=top,
+            pressure=pressure,
+            event_rate=event_rate,
+            trade_count=trade_count,
+            mid_vals=mid_vals,
+            bid_peak_recent=bid_peak,
+            liquidity_imbalance=liquidity_imb,
+            z_pressure=z_pressure,
+            z_tob=z_tob,
+            z_event=z_event,
+            z_trade=z_trade,
+            is_repeated_signal_30s=bool(out["is_repeated_signal_30s"]),
+            is_repeated_signal_60s=bool(out["is_repeated_signal_60s"]),
+            is_repeated_signal_120s=bool(out["is_repeated_signal_120s"]),
+        )
+        out.update(fa)
         return out
 
     def process_object(self, obj: dict[str, Any]) -> None:
@@ -357,6 +491,9 @@ class EthGeometryEngine(StopGridEngine):
             return
 
         self._expire_windows(top.ts)
+        while self._bb_snapshots and self._bb_snapshots[0][0] < top.ts - LOOKBACK_SEC:
+            self._bb_snapshots.popleft()
+        self._bb_snapshots.append((top.ts, float(top.best_bid_sz)))
         self.mid_window.append((top.ts, top.mid))
         self.last_mid = top.mid
         self._maybe_manage_open_trade(top)
@@ -1104,9 +1241,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ETH geometry grid: stops × timeouts, fees, leverage")
     parser.add_argument(
         "--study",
-        choices=("geometry", "ultimate"),
+        choices=("geometry", "ultimate", "pr-final"),
         default="geometry",
-        help="geometry=classic grid; ultimate=PR-ULTIMATE edge validation (research JSON)",
+        help="geometry=classic grid; ultimate / pr-final = research JSON studies",
     )
     parser.add_argument("--data-source", choices=("coinbase", "bybit"), default="bybit")
     parser.add_argument("--stops", default="1,2,3,5,8,10")
@@ -1126,8 +1263,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--label-timeout", type=float, default=900.0, help="Reference timeout for Phase 1 (ultimate)")
     parser.add_argument("--skip-phase2", action="store_true", help="Ultimate study: Phase 1 (+3) only")
     parser.add_argument("--skip-phase3", action="store_true", help="Ultimate study: skip execution stress stub")
+    parser.add_argument(
+        "--pr-final-json-output",
+        type=Path,
+        default=REPORTS_DIR / "pr_final_entry_study.json",
+        help="Output path when --study pr-final",
+    )
+    parser.add_argument("--skip-part-e", action="store_true", help="PR-FINAL: Part D only (no executable geometry grid)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.study == "pr-final":
+        from tjtb.research.pr_final_entry_study import run_pr_final_study
+
+        run_pr_final_study(
+            data_source=args.data_source,
+            raw_dir=args.raw_dir,
+            symbol=str(args.symbol).strip().upper(),
+            fee_rate=float(args.fee_rate),
+            json_output=args.pr_final_json_output,
+            run_part_e=not args.skip_part_e,
+        )
+        LOGGER.info("PR-FINAL study written to %s", args.pr_final_json_output)
+        return 0
+
     if args.study == "ultimate":
         from tjtb.research.ultimate_edge_study import run_ultimate_study
 
