@@ -1232,6 +1232,10 @@ def write_eth_geometry_reports(
         "results": [_sanitize_json_row(asdict(r)) for r in results],
     }
 
+    from tjtb.research.maker_fill_quality_study import build_maker_fill_quality_study
+
+    summary.update(build_maker_fill_quality_study(results))
+
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
     return summary

@@ -30,6 +30,7 @@ from tjtb.research.eth_geometry_runner import (
     write_eth_geometry_reports,
 )
 from tjtb.research.stop_grid_runner import _avg_notional_and_lev
+from tjtb.research.maker_fill_quality_study import build_maker_fill_quality_study
 from tjtb.research.pr_final_entry_study import is_clean_2r_winner, run_pr_final_study
 from tjtb.research.ultimate_edge_study import (
     _sanitize_for_json,
@@ -110,6 +111,11 @@ def test_eth_geometry_output_files(tmp_path):
     assert "best_by_survivability" in summary
     assert "best_realistic_execution_candidate" in summary
     assert "excursion_analysis" in summary
+    assert "maker_fill_quality_study" in summary
+    assert "maker_execution_candidates" in summary
+    assert "adverse_selection_analysis" in summary
+    assert "execution_verdict" in summary
+    assert summary["execution_verdict"]["verdict"] in ("PRODUCTION_CANDIDATE_EXISTS", "STRATEGY_MUST_BE_REDESIGNED")
 
 
 def test_default_timeout_grid_includes_long_windows():
@@ -512,6 +518,59 @@ def test_eth_geometry_research_overrides_tp_be():
     )
     assert eng.research_fixed_tp_r == pytest.approx(1.25)
     assert eng.research_be_mode == "none"
+
+
+def test_maker_fill_quality_study_synthetic_core_cohort():
+    trade = {
+        "side": "short",
+        "entry_price": 3000.0,
+        "r_value": 4.0,
+        "mfe_r": 2.5,
+        "mae_r": -0.2,
+        "max_price_reached": 3000.6,
+        "seconds_to_mae": 10.0,
+        "entry_spread": 0.5,
+        "entry_session": "asia",
+        "is_repeated_signal_30s": True,
+        "failed_absorption_medium": True,
+        "failed_absorption_strict": False,
+        "entry_signal_key": "k1",
+        "time_to_first_1R": 50.0,
+        "time_to_first_2R": 200.0,
+        "entry_bid_size_vs_peak_ratio": 0.7,
+        "entry_mid_range_ratio": 0.001,
+    }
+    r = EthGeometryResult(
+        stop_size=2.0,
+        timeout_sec=900.0,
+        total_trades=1,
+        win_rate=1.0,
+        tp_rate=1.0,
+        timeout_rate=0.0,
+        average_r=4.0,
+        total_realized_r=4.0,
+        max_drawdown_r=0.0,
+        max_losing_streak=0,
+        profit_factor_net=10.0,
+        average_trade_duration_sec=100.0,
+        average_notional_required=0.0,
+        leverage_required_5k=0.0,
+        leverage_required_10k=0.0,
+        leverage_required_50k=0.0,
+        round_trip_fee_rate=ROUND_TRIP_TAKER_FEE,
+        average_round_trip_fee_usd=0.0,
+        average_fee_cost_r=0.0,
+        net_average_r_after_fees=1.0,
+        net_total_r_after_fees=1.0,
+        trades=[trade],
+    )
+    doc = build_maker_fill_quality_study([r])
+    assert doc["maker_fill_quality_study"]["cohort_counts"]["core_strategy_signals"] == 1
+    pm = doc["maker_fill_quality_study"]["per_model"]
+    assert pm["A_market_baseline"]["signal_count"] == 1
+    assert pm["B_limit_0_25R_pullback"]["fill_rate"] == pytest.approx(1.0)
+    assert pm["C_limit_0_50R_pullback"]["fill_rate"] == pytest.approx(0.0)
+    assert doc["execution_verdict"]["verdict"] in ("PRODUCTION_CANDIDATE_EXISTS", "STRATEGY_MUST_BE_REDESIGNED")
 
 
 def test_production_defaults_unchanged(tmp_path, monkeypatch):
