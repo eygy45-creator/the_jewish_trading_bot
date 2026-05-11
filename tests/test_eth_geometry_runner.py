@@ -481,6 +481,26 @@ def test_run_pr_final_empty_raw(tmp_path):
     assert doc.get("error") == "no_raw_objects"
 
 
+def test_pr_final_final_edge_study_contract(tmp_path):
+    raw = tmp_path / "bybit_20260501.ndjson"
+    _write_ndjson(raw, _sample_eth_rows())
+    doc = run_pr_final_study(raw_dir=tmp_path, data_source="bybit", run_part_e=False)
+    fes = doc.get("final_edge_study")
+    assert isinstance(fes, dict)
+    assert fes.get("baseline_summary") is not None
+    assert fes.get("filtered_entry_results") is not None
+    assert fes.get("failed_absorption_comparison") is not None
+    assert fes.get("limit_entry_feasibility") is not None
+    assert fes.get("pass_fail_verdict") is not None
+    best = fes.get("best_candidate")
+    assert best is not None
+    assert ("trade_count" in best) or (best.get("status") == "fail")
+    lim = fes["limit_entry_feasibility"]
+    assert isinstance(lim.get("results"), list)
+    assert len(lim["results"]) >= 1
+    assert doc["constraints"]["no_future_leakage"] is True
+
+
 def test_eth_geometry_research_overrides_tp_be():
     eng = EthGeometryEngine(
         logging.getLogger("tjtb.test.override"),
