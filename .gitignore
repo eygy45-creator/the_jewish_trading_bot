@@ -1,6 +1,7 @@
 data/raw/
 data/parsed/
-reports/
+reports/*
+!reports/*.py
 runs/
 logs/
 *.ndjson
