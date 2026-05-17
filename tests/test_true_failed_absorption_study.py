@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,6 +83,22 @@ def test_excursion_short_reaches_1r():
     ex = _excursion_from_path(side="short", mids=mids, entry_ts=entry_ts, entry=entry, stop_dist=stop, horizon=100.0)
     assert ex["mfe_r"] >= 1.0 - 1e-6
     assert ex.get("time_to_first_1R") is not None
+
+
+def test_cli_exposes_partials_dir_force_max_files():
+    env = {**os.environ, "PYTHONPATH": "src"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "tjtb.research.true_failed_absorption_study", "--help"],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--partials-dir" in proc.stdout
+    assert "--force" in proc.stdout
+    assert "--max-files" in proc.stdout
 
 
 def test_trim_mids_stable():
