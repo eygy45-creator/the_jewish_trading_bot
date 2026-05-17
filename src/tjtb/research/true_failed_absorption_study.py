@@ -4,7 +4,9 @@ True failed-absorption sequence study (research only).
 Auction-structure path: aggression → absorption → failed retest → continuation,
 for both long and short, with structure-based invalidation stops (not fixed $2).
 
-Outputs: reports/true_failed_absorption_study.json
+Outputs:
+  reports/true_failed_absorption_partials/<raw_filename>.json (per file)
+  reports/true_failed_absorption_study.json (aggregated)
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import Any, Optional
 
 from tjtb.live.live_paper_crypto import BYBIT_RAW_GLOB, LOOKBACK_SEC, LivePaperEngine, TopState
 from tjtb.research.eth_geometry_runner import ROUND_TRIP_TAKER_FEE, _entry_session_label, _per_trade_net_r
-from tjtb.research.stop_grid_runner import _iter_objects, _profit_factor
+from tjtb.research.stop_grid_runner import _profit_factor
 from tjtb.runtime_paths import RAW_DATA_DIR, REPORTS_DIR
 
 LOGGER = logging.getLogger("tjtb.research.true_failed_absorption")
@@ -37,6 +39,8 @@ MAKER_ENTRY_REBATE = -0.0001
 FEE_MAKER_ENTRY_TAKER_EXIT = max(0.0, MAKER_ENTRY_REBATE + ROUND_TRIP_TAKER_FEE / 2.0)
 
 MIN_SIGNALS_FOR_VERDICT = 25
+PARTIAL_VERSION = 1
+DEFAULT_PARTIALS_DIR = REPORTS_DIR / "true_failed_absorption_partials"
 
 
 def _sf(x: Any, default: float = float("nan")) -> float:
@@ -1028,6 +1032,460 @@ def _by_key(rows: list[dict[str, Any]], key: str) -> dict[str, list[dict[str, An
     return out
 
 
+def _empty_trade_bucket() -> dict[str, float | int]:
+    return {
+        "n": 0,
+        "win_count": 0,
+        "reach_1r_count": 0,
+        "reach_2r_count": 0,
+        "reach_3r_count": 0,
+        "net_r_sum": 0.0,
+        "gross_wins": 0.0,
+        "gross_losses": 0.0,
+    }
+
+
+def _accumulate_row_into_bucket(
+    bucket: dict[str, float | int],
+    row: dict[str, Any],
+    net_key: str,
+) -> None:
+    net = _sf(row.get(net_key))
+    if not math.isfinite(net):
+        return
+    bucket["n"] = int(bucket["n"]) + 1
+    if net > 0:
+        bucket["win_count"] = int(bucket["win_count"]) + 1
+        bucket["gross_wins"] = float(bucket["gross_wins"]) + net
+    elif net < 0:
+        bucket["gross_losses"] = float(bucket["gross_losses"]) - net
+    bucket["net_r_sum"] = float(bucket["net_r_sum"]) + net
+    mfe = _sf(row.get("mfe_r"))
+    if math.isfinite(mfe):
+        if mfe >= 1.0 - 1e-9:
+            bucket["reach_1r_count"] = int(bucket["reach_1r_count"]) + 1
+        if mfe >= 2.0 - 1e-9:
+            bucket["reach_2r_count"] = int(bucket["reach_2r_count"]) + 1
+        if mfe >= 3.0 - 1e-9:
+            bucket["reach_3r_count"] = int(bucket["reach_3r_count"]) + 1
+
+
+def _merge_trade_buckets(
+    a: dict[str, float | int],
+    b: dict[str, float | int],
+) -> dict[str, float | int]:
+    out = _empty_trade_bucket()
+    for key in out:
+        out[key] = type(out[key])(a.get(key, 0)) + type(out[key])(b.get(key, 0))  # type: ignore[operator]
+    return out
+
+
+def _finalize_trade_bucket(bucket: dict[str, float | int]) -> dict[str, Any]:
+    n = int(bucket["n"])
+    if not n:
+        return {
+            "n": 0,
+            "win_rate": 0.0,
+            "reach_1R": 0.0,
+            "reach_2R": 0.0,
+            "reach_3R": 0.0,
+            "net_expectancy_after_fees": 0.0,
+            "profit_factor_net": 0.0,
+        }
+    gw = float(bucket["gross_wins"])
+    gl = float(bucket["gross_losses"])
+    if gl <= 1e-12:
+        pf = float("inf") if gw > 0 else 0.0
+    else:
+        pf = gw / gl
+    if not math.isfinite(pf):
+        pf = 0.0
+    return {
+        "n": n,
+        "win_rate": int(bucket["win_count"]) / n,
+        "reach_1R": int(bucket["reach_1r_count"]) / n,
+        "reach_2R": int(bucket["reach_2r_count"]) / n,
+        "reach_3R": int(bucket["reach_3r_count"]) / n,
+        "net_expectancy_after_fees": float(bucket["net_r_sum"]) / n,
+        "profit_factor_net": float(pf),
+    }
+
+
+def _empty_aggregatable_stats() -> dict[str, Any]:
+    return {
+        "overall": _empty_trade_bucket(),
+        "by_side": {"short": _empty_trade_bucket(), "long": _empty_trade_bucket()},
+        "by_session": {},
+        "by_regime": {},
+        "entry_models": {
+            "A": {"n": 0, "net_r_1r_sum": 0.0},
+            "B_filled": {"n": 0, "net_r_1r_sum": 0.0, "loser_count": 0},
+            "C_filled": {"n": 0, "net_r_1r_sum": 0.0},
+        },
+        "structural_vs_fixed": {"n": 0, "struct_net_sum": 0.0, "fixed_net_sum": 0.0},
+        "structural_stop_dist_values": [],
+        "retest_score_values": [],
+        "adverse": {
+            "market_n": 0,
+            "market_loser_count": 0,
+            "maker_b_filled_n": 0,
+            "maker_b_filled_loser_count": 0,
+        },
+    }
+
+
+def _stats_from_rows_and_models(
+    rows: list[dict[str, Any]],
+    per_row_models: list[dict[str, Any]],
+) -> dict[str, Any]:
+    stats = _empty_aggregatable_stats()
+    for r, m in zip(rows, per_row_models):
+        _accumulate_row_into_bucket(stats["overall"], r, "oco_market_net_r_1R")
+        side = str(r.get("side") or "unknown").lower()
+        if side in stats["by_side"]:
+            _accumulate_row_into_bucket(stats["by_side"][side], r, "oco_market_net_r_1R")
+        sess = str(r.get("entry_session") or "unknown")
+        stats["by_session"].setdefault(sess, _empty_trade_bucket())
+        _accumulate_row_into_bucket(stats["by_session"][sess], r, "oco_market_net_r_1R")
+        reg = str(r.get("regime") or "unknown")
+        stats["by_regime"].setdefault(reg, _empty_trade_bucket())
+        _accumulate_row_into_bucket(stats["by_regime"][reg], r, "oco_market_net_r_1R")
+
+        struct_net = _sf(r.get("oco_market_net_r_1R"))
+        fixed_net = _sf(r.get("oco_fixed2usd_net_r_1R"))
+        if math.isfinite(struct_net) and math.isfinite(fixed_net):
+            svf = stats["structural_vs_fixed"]
+            svf["n"] = int(svf["n"]) + 1
+            svf["struct_net_sum"] = float(svf["struct_net_sum"]) + struct_net
+            svf["fixed_net_sum"] = float(svf["fixed_net_sum"]) + fixed_net
+
+        sd = _sf(r.get("structural_stop_distance"))
+        if math.isfinite(sd):
+            stats["structural_stop_dist_values"].append(sd)
+        rs = _sf(r.get("retest_score"))
+        if math.isfinite(rs):
+            stats["retest_score_values"].append(rs)
+
+        a_net = _sf(m.get("A_market_after_failed_retest", {}).get("1R"))
+        if math.isfinite(a_net):
+            em = stats["entry_models"]["A"]
+            em["n"] = int(em["n"]) + 1
+            em["net_r_1r_sum"] = float(em["net_r_1r_sum"]) + a_net
+
+        b_zone = m.get("B_maker_pullback_0_25R_zone", {})
+        if b_zone.get("synthetic_filled"):
+            b_net = _sf(b_zone.get("1R"))
+            if math.isfinite(b_net):
+                bf = stats["entry_models"]["B_filled"]
+                bf["n"] = int(bf["n"]) + 1
+                bf["net_r_1r_sum"] = float(bf["net_r_1r_sum"]) + b_net
+                if b_net < 0:
+                    bf["loser_count"] = int(bf["loser_count"]) + 1
+
+        c_zone = m.get("C_maker_absorption_retest_level", {})
+        if c_zone.get("synthetic_filled"):
+            c_net = _sf(c_zone.get("1R"))
+            if math.isfinite(c_net):
+                cf = stats["entry_models"]["C_filled"]
+                cf["n"] = int(cf["n"]) + 1
+                cf["net_r_1r_sum"] = float(cf["net_r_1r_sum"]) + c_net
+
+        adv = stats["adverse"]
+        mkt = _sf(r.get("oco_market_net_r_1R"))
+        if math.isfinite(mkt):
+            adv["market_n"] = int(adv["market_n"]) + 1
+            if mkt < 0:
+                adv["market_loser_count"] = int(adv["market_loser_count"]) + 1
+        if b_zone.get("synthetic_filled"):
+            b_net = _sf(b_zone.get("1R"))
+            if math.isfinite(b_net):
+                adv["maker_b_filled_n"] = int(adv["maker_b_filled_n"]) + 1
+                if b_net < 0:
+                    adv["maker_b_filled_loser_count"] = int(adv["maker_b_filled_loser_count"]) + 1
+
+    return stats
+
+
+def _merge_aggregatable_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    out = _empty_aggregatable_stats()
+    out["overall"] = _merge_trade_buckets(a["overall"], b["overall"])
+    for side in ("short", "long"):
+        out["by_side"][side] = _merge_trade_buckets(a["by_side"][side], b["by_side"][side])
+    for key in set(a["by_session"]) | set(b["by_session"]):
+        ba = a["by_session"].get(key, _empty_trade_bucket())
+        bb = b["by_session"].get(key, _empty_trade_bucket())
+        out["by_session"][key] = _merge_trade_buckets(ba, bb)
+    for key in set(a["by_regime"]) | set(b["by_regime"]):
+        ba = a["by_regime"].get(key, _empty_trade_bucket())
+        bb = b["by_regime"].get(key, _empty_trade_bucket())
+        out["by_regime"][key] = _merge_trade_buckets(ba, bb)
+    for model in ("A", "B_filled", "C_filled"):
+        for field in a["entry_models"][model]:
+            out["entry_models"][model][field] = type(a["entry_models"][model][field])(  # type: ignore[index]
+                a["entry_models"][model].get(field, 0)
+            ) + type(a["entry_models"][model][field])(b["entry_models"][model].get(field, 0))
+    svf = out["structural_vs_fixed"]
+    for field in ("n", "struct_net_sum", "fixed_net_sum"):
+        svf[field] = type(svf[field])(a["structural_vs_fixed"].get(field, 0)) + type(svf[field])(  # type: ignore[index]
+            b["structural_vs_fixed"].get(field, 0)
+        )
+    out["structural_stop_dist_values"] = list(a["structural_stop_dist_values"]) + list(
+        b["structural_stop_dist_values"]
+    )
+    out["retest_score_values"] = list(a["retest_score_values"]) + list(b["retest_score_values"])
+    for field in out["adverse"]:
+        out["adverse"][field] = int(a["adverse"].get(field, 0)) + int(b["adverse"].get(field, 0))
+    return out
+
+
+def _merge_partial_stats(partials: list[dict[str, Any]]) -> dict[str, Any]:
+    merged = _empty_aggregatable_stats()
+    for p in partials:
+        stats = p.get("stats")
+        if isinstance(stats, dict):
+            merged = _merge_aggregatable_stats(merged, stats)
+    return merged
+
+
+def _adverse_from_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    adv = stats["adverse"]
+    n = int(adv["market_n"])
+    if not n:
+        return {"note": "no_rows", "baseline_loser_rate_1R_market": 0.0}
+    base_losers = int(adv["market_loser_count"]) / n
+    filled_n = int(adv["maker_b_filled_n"])
+    if filled_n:
+        mk = int(adv["maker_b_filled_loser_count"]) / filled_n
+        delta = mk - base_losers
+    else:
+        mk = None
+        delta = None
+    return {
+        "baseline_loser_rate_1R_market": float(base_losers),
+        "filled_maker_B_loser_rate_1R": mk,
+        "delta_filled_maker_B_minus_market": delta,
+        "definition": "Adverse selection: maker-B loser rate minus market 1R OCO loser rate on same signals.",
+    }
+
+
+def _entry_compare_from_stats(stats: dict[str, Any]) -> dict[str, float]:
+    em = stats["entry_models"]
+    a_n = int(em["A"]["n"])
+    b_n = int(em["B_filled"]["n"])
+    c_n = int(em["C_filled"]["n"])
+    return {
+        "A_market_1R_ev": float(em["A"]["net_r_1r_sum"]) / a_n if a_n else float("nan"),
+        "B_maker_1R_ev": float(em["B_filled"]["net_r_1r_sum"]) / b_n if b_n else float("nan"),
+        "C_maker_1R_ev": float(em["C_filled"]["net_r_1r_sum"]) / c_n if c_n else float("nan"),
+    }
+
+
+def _struct_vs_fixed_from_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    svf = stats["structural_vs_fixed"]
+    n = int(svf["n"])
+    if not n:
+        return {
+            "mean_net_r_1R_market_structure_stop": float("nan"),
+            "mean_net_r_1R_market_fixed_2usd_stop": float("nan"),
+            "structure_stop_better_mean_1R_ev": False,
+        }
+    mean_struct = float(svf["struct_net_sum"]) / n
+    mean_fixed = float(svf["fixed_net_sum"]) / n
+    return {
+        "mean_net_r_1R_market_structure_stop": mean_struct,
+        "mean_net_r_1R_market_fixed_2usd_stop": mean_fixed,
+        "structure_stop_better_mean_1R_ev": bool(mean_struct > mean_fixed + 1e-12),
+    }
+
+
+def _list_raw_files(raw_dir: Path, glob_pat: str) -> list[Path]:
+    return sorted(
+        [p for p in raw_dir.glob(glob_pat) if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+    )
+
+
+def _iter_objects_file(path: Path) -> Any:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for ln in f:
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _partial_output_path(partials_dir: Path, raw_file: Path) -> Path:
+    return partials_dir / f"{raw_file.name}.json"
+
+
+def _study_parameters() -> dict[str, Any]:
+    return {
+        "path_horizon_sec": PATH_HORIZON_SEC,
+        "cooldown_sec": COOLDOWN_SEC,
+        "fixed_reference_stop_usd": FIXED_REF_STOP_USD,
+        "limit_fill_window_sec": LIMIT_FILL_WINDOW_SEC,
+        "primary_signal": "auction_microstructure_state_machine_tob_pressure_mid_box",
+        "supporting_features": "z_pressure_z_tob_recorded_at_entry_not_used_as_primary_trigger",
+        "fee_round_trip_taker": ROUND_TRIP_TAKER_FEE,
+        "fee_maker_entry_taker_exit_effective": FEE_MAKER_ENTRY_TAKER_EXIT,
+    }
+
+
+def _process_raw_file(
+    path: Path,
+    *,
+    data_source: str,
+    symbol: str,
+) -> dict[str, Any]:
+    replay = AuctionStructureReplay(LOGGER, data_source=data_source)
+    mids: list[tuple[float, float]] = []
+    raw_count = 0
+    for obj in _iter_objects_file(path):
+        raw_count += 1
+        top = replay.process_object(obj)
+        if top is not None:
+            mids.append((float(top.ts), float(top.mid)))
+
+    signals = list(replay.signals)
+    rows = _build_rows_for_signals(signals, mids)
+    per_row_models = [_evaluate_entry_models(r, mids) for r in rows]
+    stats = _stats_from_rows_and_models(rows, per_row_models)
+    del mids, replay, per_row_models
+
+    return {
+        "partial_version": PARTIAL_VERSION,
+        "source_file": path.name,
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "raw_event_count": raw_count,
+        "signals_detected": len(signals),
+        "executed_rows": len(rows),
+        "stats": stats,
+        "rows_sample": rows[:40],
+    }
+
+
+def _collect_rows_sample(partials: list[dict[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
+    sample: list[dict[str, Any]] = []
+    for p in partials:
+        for row in p.get("rows_sample") or []:
+            if len(sample) >= limit:
+                return sample
+            sample.append(row)
+    return sample
+
+
+def _aggregate_partials(
+    partials: list[dict[str, Any]],
+    *,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    merged = _merge_partial_stats(partials)
+    total_signals = sum(int(p.get("signals_detected", 0)) for p in partials)
+    total_rows = int(merged["overall"]["n"])
+    raw_events = sum(int(p.get("raw_event_count", 0)) for p in partials)
+
+    entry_compare = _entry_compare_from_stats(merged)
+    struct_vs_fixed = _struct_vs_fixed_from_stats(merged)
+    overall = _finalize_trade_bucket(merged["overall"])
+    session_summary = {
+        sess: _finalize_trade_bucket(bucket)
+        for sess, bucket in sorted(merged["by_session"].items())
+    }
+    regime_summary = {
+        reg: _finalize_trade_bucket(bucket)
+        for reg, bucket in sorted(merged["by_regime"].items())
+    }
+
+    short_ev = _finalize_trade_bucket(merged["by_side"]["short"])["net_expectancy_after_fees"]
+    long_ev = _finalize_trade_bucket(merged["by_side"]["long"])["net_expectancy_after_fees"]
+    short_n = int(merged["by_side"]["short"]["n"])
+    long_n = int(merged["by_side"]["long"]["n"])
+    if not short_n and not long_n:
+        best_side = "insufficient_data"
+    elif short_ev > long_ev:
+        best_side = "short"
+    else:
+        best_side = "long"
+
+    struct_ev = overall["net_expectancy_after_fees"]
+    positive_edge = bool(total_rows >= MIN_SIGNALS_FOR_VERDICT and struct_ev > 0)
+    ev_a = float(entry_compare.get("A_market_1R_ev", float("nan")))
+    pf_s = overall["profit_factor_net"]
+    best_entry = max(
+        ("A_market", entry_compare.get("A_market_1R_ev", float("nan"))),
+        ("B_maker_pullback", entry_compare.get("B_maker_1R_ev", float("nan"))),
+        ("C_maker_absorption", entry_compare.get("C_maker_1R_ev", float("nan"))),
+        key=lambda x: x[1] if math.isfinite(x[1]) else -1e18,
+    )
+    if session_summary:
+        best_session = max(
+            session_summary.items(),
+            key=lambda kv: float(kv[1].get("net_expectancy_after_fees") or -1e18),
+        )[0]
+    else:
+        best_session = "insufficient_data"
+
+    production_candidate = bool(
+        total_rows >= MIN_SIGNALS_FOR_VERDICT
+        and positive_edge
+        and math.isfinite(ev_a)
+        and ev_a > 0
+        and pf_s >= 1.05
+    )
+
+    dist_vals = merged["structural_stop_dist_values"]
+    retest_vals = merged["retest_score_values"]
+    doc: dict[str, Any] = {
+        **meta,
+        "raw_event_count_estimate": raw_events,
+        "signals_detected": total_signals,
+        "executed_rows": total_rows,
+        "files_in_aggregate": len(partials),
+        "structural_stop_usd_stats": {
+            "mean": _mean(dist_vals),
+            "median": _median(dist_vals),
+        },
+        "overall_market_structure_stop": overall,
+        "by_side": {
+            "short": _finalize_trade_bucket(merged["by_side"]["short"]),
+            "long": _finalize_trade_bucket(merged["by_side"]["long"]),
+        },
+        "session_attribution": session_summary,
+        "regime_attribution": regime_summary,
+        "entry_model_ev_1R": entry_compare,
+        "structural_vs_fixed_stop": struct_vs_fixed,
+        "failed_retest_quality": {
+            "mean_retest_score": _mean(retest_vals),
+            "median_retest_score": _median(retest_vals),
+        },
+        "adverse_selection_analysis": _adverse_from_stats(merged),
+        "signals_sample": _collect_rows_sample(partials),
+        "best_candidates": {
+            "best_side_1R_ev": best_side,
+            "best_session": best_session,
+            "best_entry_model": best_entry[0],
+        },
+    }
+    doc["verdict"] = _final_verdict(
+        trade_count=total_rows,
+        struct_net_expectancy=struct_ev,
+        hints={
+            "positive_edge": positive_edge,
+            "best_side_1R_ev": best_side,
+            "best_session": best_session,
+            "best_entry_model": best_entry[0],
+            "struct_vs_fixed": struct_vs_fixed,
+            "production_candidate": production_candidate,
+        },
+    )
+    return doc
+
+
 def _adverse_block(rows: list[dict[str, Any]], per_row_models: list[dict[str, Any]]) -> dict[str, Any]:
     n = len(rows)
     if not n:
@@ -1060,180 +1518,79 @@ def run_true_failed_absorption_study(
     raw_dir: Path = RAW_DATA_DIR,
     symbol: str = "ETHUSDT",
     json_output: Path = REPORTS_DIR / "true_failed_absorption_study.json",
+    partials_dir: Path = DEFAULT_PARTIALS_DIR,
+    force: bool = False,
+    max_files: Optional[int] = None,
 ) -> dict[str, Any]:
     glob_pat = BYBIT_RAW_GLOB if data_source == "bybit" else "*.ndjson"
-    objs = list(_iter_objects(raw_dir, glob_pat))
-    doc: dict[str, Any] = {
+    raw_files = _list_raw_files(raw_dir, glob_pat)
+    if max_files is not None and max_files > 0:
+        raw_files = raw_files[: max_files]
+
+    meta: dict[str, Any] = {
         "study": "true_failed_absorption_sequence",
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-        "parameters": {
-            "path_horizon_sec": PATH_HORIZON_SEC,
-            "cooldown_sec": COOLDOWN_SEC,
-            "fixed_reference_stop_usd": FIXED_REF_STOP_USD,
-            "limit_fill_window_sec": LIMIT_FILL_WINDOW_SEC,
-            "primary_signal": "auction_microstructure_state_machine_tob_pressure_mid_box",
-            "supporting_features": "z_pressure_z_tob_recorded_at_entry_not_used_as_primary_trigger",
-            "fee_round_trip_taker": ROUND_TRIP_TAKER_FEE,
-            "fee_maker_entry_taker_exit_effective": FEE_MAKER_ENTRY_TAKER_EXIT,
-        },
+        "parameters": _study_parameters(),
         "data_source": data_source,
         "symbol": str(symbol).strip().upper(),
-        "raw_event_count_estimate": len(objs),
+        "partials_dir": str(partials_dir),
+        "raw_files_discovered": len(raw_files),
+        "processing_mode": "file_by_file",
     }
 
-    if not objs:
-        doc["verdict"] = _final_verdict(
-            [],
-            [],
-            {
-                "best_side_1R_ev": "insufficient_data",
-                "best_session": "insufficient_data",
-                "best_entry_model": "insufficient_data",
-                "struct_vs_fixed": {},
-                "production_candidate": False,
-            },
-        )
-        json_output.parent.mkdir(parents=True, exist_ok=True)
-        json_output.write_text(json.dumps(_sanitize(doc), indent=2), encoding="utf-8")
-        return doc
+    partials_dir.mkdir(parents=True, exist_ok=True)
+    partials: list[dict[str, Any]] = []
+    skipped_resume: list[str] = []
+    processed_now: list[str] = []
 
     prev_sym = os.environ.get("BYBIT_SYMBOL")
     os.environ["BYBIT_SYMBOL"] = str(symbol).strip().upper()
     try:
-        replay = AuctionStructureReplay(LOGGER, data_source=data_source)
-        mids: list[tuple[float, float]] = []
-        for obj in objs:
-            top = replay.process_object(obj)
-            if top is not None:
-                mids.append((float(top.ts), float(top.mid)))
+        for raw_path in raw_files:
+            partial_path = _partial_output_path(partials_dir, raw_path)
+            if partial_path.is_file() and not force:
+                partial = json.loads(partial_path.read_text(encoding="utf-8"))
+                partials.append(partial)
+                skipped_resume.append(raw_path.name)
+                LOGGER.info("resume skip %s (partial exists)", raw_path.name)
+                continue
 
-        signals = list(replay.signals)
-        rows = _build_rows_for_signals(signals, mids)
+            LOGGER.info("processing %s", raw_path.name)
+            partial = _process_raw_file(raw_path, data_source=data_source, symbol=symbol)
+            partial_path.write_text(json.dumps(_sanitize(partial), indent=2), encoding="utf-8")
+            partials.append(partial)
+            processed_now.append(raw_path.name)
+            del partial
 
-        per_row_models: list[dict[str, Any]] = []
-        for r in rows:
-            per_row_models.append(_evaluate_entry_models(r, mids))
+        meta["files_skipped_resume"] = skipped_resume
+        meta["files_processed_now"] = processed_now
 
-        struct_dists = [_sf(r.get("structural_stop_distance")) for r in rows]
-        fixed_nets = [_sf(r.get("oco_fixed2usd_net_r_1R")) for r in rows]
-        struct_nets = [_sf(r.get("oco_market_net_r_1R")) for r in rows]
-
-        short_r = [r for r in rows if str(r.get("side")) == "short"]
-        long_r = [r for r in rows if str(r.get("side")) == "long"]
-
-        ev_s = _mean([_sf(r.get("oco_market_net_r_1R")) for r in short_r])
-        ev_l = _mean([_sf(r.get("oco_market_net_r_1R")) for r in long_r])
-        if not short_r and not long_r:
-            best_side = "insufficient_data"
-        elif ev_s > ev_l:
-            best_side = "short"
-        else:
-            best_side = "long"
-
-        session_summary = {
-            sess: _summarize_trades(sub, "oco_market_net_r_1R")
-            for sess, sub in sorted(_by_key(rows, "entry_session").items())
-        }
-        regime_summary = {
-            reg: _summarize_trades(sub, "oco_market_net_r_1R")
-            for reg, sub in sorted(_by_key(rows, "regime").items())
-        }
-
-        struct_vs_fixed = {
-            "mean_net_r_1R_market_structure_stop": _mean(struct_nets),
-            "mean_net_r_1R_market_fixed_2usd_stop": _mean(fixed_nets),
-            "structure_stop_better_mean_1R_ev": bool(_mean(struct_nets) > _mean(fixed_nets) + 1e-12),
-        }
-
-        entry_compare = {
-            "A_market_1R_ev": float("nan"),
-            "B_maker_1R_ev": float("nan"),
-            "C_maker_1R_ev": float("nan"),
-        }
-        if per_row_models:
-            b_sel = [
-                _sf(m["B_maker_pullback_0_25R_zone"]["1R"])
-                for m in per_row_models
-                if m["B_maker_pullback_0_25R_zone"].get("synthetic_filled")
-            ]
-            c_sel = [
-                _sf(m["C_maker_absorption_retest_level"]["1R"])
-                for m in per_row_models
-                if m["C_maker_absorption_retest_level"].get("synthetic_filled")
-            ]
-            entry_compare = {
-                "A_market_1R_ev": _mean([_sf(m["A_market_after_failed_retest"]["1R"]) for m in per_row_models]),
-                "B_maker_1R_ev": _mean(b_sel) if b_sel else float("nan"),
-                "C_maker_1R_ev": _mean(c_sel) if c_sel else float("nan"),
+        if not partials:
+            doc = {
+                **meta,
+                "raw_event_count_estimate": 0,
+                "signals_detected": 0,
+                "executed_rows": 0,
+                "files_in_aggregate": 0,
+                "best_candidates": {
+                    "best_side_1R_ev": "insufficient_data",
+                    "best_session": "insufficient_data",
+                    "best_entry_model": "insufficient_data",
+                },
             }
-
-        positive_edge = bool(len(rows) >= MIN_SIGNALS_FOR_VERDICT and _mean(struct_nets) > 0)
-        ev_a = float(entry_compare.get("A_market_1R_ev", float("nan")))
-        pf_s = float(_profit_factor(struct_nets))
-        if not math.isfinite(pf_s):
-            pf_s = 0.0
-        best_entry = max(
-            ("A_market", entry_compare.get("A_market_1R_ev", float("nan"))),
-            ("B_maker_pullback", entry_compare.get("B_maker_1R_ev", float("nan"))),
-            ("C_maker_absorption", entry_compare.get("C_maker_1R_ev", float("nan"))),
-            key=lambda x: x[1] if math.isfinite(x[1]) else -1e18,
-        )
-
-        if session_summary:
-            best_session = max(
-                session_summary.items(),
-                key=lambda kv: float(kv[1].get("net_expectancy_after_fees") or -1e18),
-            )[0]
+            doc["verdict"] = _final_verdict(
+                trade_count=0,
+                struct_net_expectancy=0.0,
+                hints={
+                    "best_side_1R_ev": "insufficient_data",
+                    "best_session": "insufficient_data",
+                    "best_entry_model": "insufficient_data",
+                    "struct_vs_fixed": {},
+                    "production_candidate": False,
+                },
+            )
         else:
-            best_session = "insufficient_data"
-
-        production_candidate = bool(
-            len(rows) >= MIN_SIGNALS_FOR_VERDICT
-            and positive_edge
-            and math.isfinite(ev_a)
-            and ev_a > 0
-            and pf_s >= 1.05
-        )
-
-        doc.update(
-            {
-                "signals_detected": len(signals),
-                "executed_rows": len(rows),
-                "structural_stop_usd_stats": {
-                    "mean": _mean(struct_dists),
-                    "median": _median(struct_dists),
-                },
-                "overall_market_structure_stop": _summarize_trades(rows, "oco_market_net_r_1R"),
-                "by_side": {
-                    "short": _summarize_trades(short_r, "oco_market_net_r_1R"),
-                    "long": _summarize_trades(long_r, "oco_market_net_r_1R"),
-                },
-                "session_attribution": session_summary,
-                "regime_attribution": regime_summary,
-                "entry_model_ev_1R": entry_compare,
-                "per_signal_entry_models": per_row_models,
-                "structural_vs_fixed_stop": struct_vs_fixed,
-                "failed_retest_quality": {
-                    "mean_retest_score": _mean([_sf(r.get("retest_score")) for r in rows]),
-                    "median_retest_score": _median([_sf(r.get("retest_score")) for r in rows]),
-                },
-                "adverse_selection_analysis": _adverse_block(rows, per_row_models),
-                "signals_sample": rows[:40],
-            }
-        )
-
-        doc["verdict"] = _final_verdict(
-            rows,
-            struct_nets,
-            {
-                "positive_edge": positive_edge,
-                "best_side_1R_ev": best_side,
-                "best_session": best_session,
-                "best_entry_model": best_entry[0],
-                "struct_vs_fixed": struct_vs_fixed,
-                "production_candidate": production_candidate,
-            },
-        )
+            doc = _aggregate_partials(partials, meta=meta)
     finally:
         if prev_sym is None:
             os.environ.pop("BYBIT_SYMBOL", None)
@@ -1247,12 +1604,13 @@ def run_true_failed_absorption_study(
 
 
 def _final_verdict(
-    rows: list[dict[str, Any]],
-    struct_nets: list[float],
+    *,
+    trade_count: int,
+    struct_net_expectancy: float,
     hints: dict[str, Any],
 ) -> dict[str, Any]:
-    n = len(rows)
-    q1 = bool(n >= MIN_SIGNALS_FOR_VERDICT and _mean(struct_nets) > 0)
+    n = trade_count
+    q1 = bool(n >= MIN_SIGNALS_FOR_VERDICT and struct_net_expectancy > 0)
     svf = hints.get("struct_vs_fixed") if isinstance(hints.get("struct_vs_fixed"), dict) else {}
     struct_beats_fixed = bool(svf.get("structure_stop_better_mean_1R_ev", False))
     out = {
@@ -1284,6 +1642,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
     p.add_argument("--symbol", default="ETHUSDT")
     p.add_argument("--json-output", type=Path, default=REPORTS_DIR / "true_failed_absorption_study.json")
+    p.add_argument(
+        "--partials-dir",
+        type=Path,
+        default=DEFAULT_PARTIALS_DIR,
+        help="Per-raw-file partial JSON outputs",
+    )
+    p.add_argument("--force", action="store_true", help="Reprocess raw files even if partial exists")
+    p.add_argument("--max-files", type=int, default=None, help="Limit number of raw files (debug)")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run_true_failed_absorption_study(
@@ -1291,6 +1657,9 @@ def main(argv: list[str] | None = None) -> int:
         raw_dir=args.raw_dir,
         symbol=str(args.symbol).strip().upper(),
         json_output=args.json_output,
+        partials_dir=args.partials_dir,
+        force=args.force,
+        max_files=args.max_files,
     )
     return 0
 
